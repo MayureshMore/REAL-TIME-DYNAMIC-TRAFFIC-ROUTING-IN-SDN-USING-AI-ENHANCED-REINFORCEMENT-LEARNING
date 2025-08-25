@@ -1,10 +1,10 @@
-# SDN tools
-sudo apt update && sudo apt install mininet -y
-pip install ryu
-
-# RL + ML
-pip install torch torchvision torchaudio
-pip install tensorflow gym numpy matplotlib networkx
-
-# Optional tools
-sudo apt install wireshark -y
+# requirements.txt (mac)
+torch
+torchvision
+torchaudio
+numpy
+gymnasium
+matplotlib
+networkx
+requests
+pydantic

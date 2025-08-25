@@ -1,0 +1,4 @@
+# requirements.vm.txt (Ubuntu VM for controller)
+ryu
+requests
+matplotlib
