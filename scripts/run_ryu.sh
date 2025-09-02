@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
-set -e
-source ~/ryu-venv/bin/activate
-cd ~/project/controller-apps
-ryu-manager controller-apps/simple_switch_13_stats.py --ofp-tcp-listen-port 6633
+set -euo pipefail
+
+
+# Usage: ./scripts/run_ryu.sh [--port 6633]
+PORT=6633
+if [[ "${1:-}" == "--port" ]]; then
+PORT=${2:?port required}
+fi
+
+
+# Activate venv on the Pi/VM where Ryu is installed
+if [[ -d "$HOME/ryu-venv" ]]; then
+# shellcheck disable=SC1091
+source "$HOME/ryu-venv/bin/activate"
+fi
+
+
+cd "$(dirname "$0")/.." # repo root
+exec ryu-manager controller-apps/monitor_rest.py --ofp-tcp-listen-port "$PORT"
