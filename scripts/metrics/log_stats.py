@@ -1,5 +1,4 @@
 # scripts/metrics/log_stats.py
-# Poll controller REST endpoints periodically and write CSV for baseline metrics
 
 
 import argparse
