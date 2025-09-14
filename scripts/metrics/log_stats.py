@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # scripts/metrics/log_stats.py
-# Poll controller REST endpoints and write CSV with counters AND per-second rates.
-# Supports a fixed --duration to auto-stop.
+
 
 import argparse
 import csv
