@@ -2,3 +2,4 @@
 ryu
 requests
 matplotlib
+jsonschema>=4.22.0
