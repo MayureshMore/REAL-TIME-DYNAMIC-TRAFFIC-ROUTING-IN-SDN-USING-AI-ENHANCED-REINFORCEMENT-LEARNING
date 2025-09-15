@@ -1,5 +1,13 @@
-# requirements.vm.txt (Ubuntu VM for controller)
-ryu
-requests
-matplotlib
+# minimal deps for controller + agents + wsgi
+requests>=2.31.0
+webob<1.9
+networkx>=2.6
 jsonschema>=4.22.0
+eventlet
+routes
+netaddr
+msgpack
+
+# NOTE: Ryu install depends on Python version. Recommended: Python 3.11 with:
+#   pip install "setuptools<66" "wheel<0.41" "ryu==4.34"
+# Or install via system packages if available.

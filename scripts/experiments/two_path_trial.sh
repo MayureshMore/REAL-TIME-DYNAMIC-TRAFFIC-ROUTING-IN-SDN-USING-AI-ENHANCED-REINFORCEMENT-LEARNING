@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Batch-run two_path with varied delay/loss; package artifacts.
 
 CTRL_IP="${CTRL_IP:-127.0.0.1}"
 REST_PORT="${REST_PORT:-8080}"
@@ -14,16 +15,13 @@ PKG="$REPO/docs/baseline/runs_${TS}.tar.gz"
 echo "Controller: $CTRL_IP:$REST_PORT | Runs: $RUNS | Duration: ${DUR}s"
 sudo mn -c || true
 
-# scenarios: tweak delay/loss asymmetrically
 DELAYS=("2ms,10ms" "5ms,5ms" "0ms,15ms")
 LOSSES=("0,0.1" "0,0" "0.05,0")
 
 for i in $(seq 1 "$RUNS"); do
-  di=$(( (i-1) % ${#DELAYS[@]} ))
-  li=$(( (i-1) % ${#LOSSES[@]} ))
+  di=$(( (i-1) % ${#DELAYS[@]} )); li=$(( (i-1) % ${#LOSSES[@]} ))
   DA="${DELAYS[$di]%,*}"; DB="${DELAYS[$di]#*,}"
   LA="${LOSSES[$li]%,*}"; LB="${LOSSES[$li]#*,}"
-
   echo "=== Run $i: delayA=$DA delayB=$DB lossA=$LA lossB=$LB ==="
   sudo python3 "$REPO/scripts/topos/two_path.py" \
     --controller_ip "$CTRL_IP" --rest_port "$REST_PORT" \

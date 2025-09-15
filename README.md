@@ -1,27 +1,22 @@
-# Real-Time Dynamic Traffic Routing in SDN using AI-Enhanced RL
+# Real-Time Dynamic Traffic Routing in SDN (AI-Enhanced RL)
 
+Ryu-based OpenFlow13 controller with:
+- Topology discovery + k-shortest paths
+- REST API for stats/paths/actions
+- Flow install/delete with cookies + timeouts
+- Bandit + LinUCB agents to select paths using live stats
+- Derived link utilization (`/metrics/links`)
+- OpenAPI spec (`/openapi.yaml`)
 
-This repo contains:
-- **Ryu controller app** with REST stats (`controller-apps/monitor_rest.py`)
-- **Mininet topologies** (single + two-path)
-- **Metrics logger** to CSV
-- **RL agent stub** (replace with DQN/GNN later)
-
-
-## Quickstart (Lab Host)
+## Quick start (controller)
 ```bash
-# Start controller (port 6633)
-./scripts/run_ryu.sh
+# Ensure Ryu is installed for Python 3.11 (see requirements.vm.txt notes)
+# Example with pyenv:
+#   pyenv install 3.11.9
+#   pyenv virtualenv 3.11.9 ryu311
+#   pyenv activate ryu311
+#   pip install -r requirements.vm.txt
+#   pip install "setuptools<66" "wheel<0.41" "ryu==4.34"
 
-
-# Single-topo smoke test
-./scripts/run_mininet.sh 127.0.0.1
-# Mininet> pingall
-
-
-# Two-path demo
-./scripts/run_mininet_two_path.sh 127.0.0.1
-
-
-# Metrics logging
-python3 scripts/metrics/log_stats.py --controller 127.0.0.1 --port 8080 --interval 2 --out docs/baseline/sample.csv
+./scripts/run_ryu.sh --ofp-port 6633 --wsapi-port 8080
+curl http://127.0.0.1:8080/api/v1/health
