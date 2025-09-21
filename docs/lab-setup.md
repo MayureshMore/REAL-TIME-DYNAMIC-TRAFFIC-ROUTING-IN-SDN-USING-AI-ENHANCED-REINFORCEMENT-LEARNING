@@ -10,4 +10,4 @@
 
 ## Controller
 ```bash
-./scripts/run_ryu.sh --port 6633
+./scripts/run_ryu.sh 

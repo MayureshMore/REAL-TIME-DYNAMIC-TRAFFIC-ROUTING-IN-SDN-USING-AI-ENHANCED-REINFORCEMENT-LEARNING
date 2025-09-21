@@ -1,10 +1,10 @@
 # requirements.txt (mac)
-ttorch
- torchvision
- torchaudio
- numpy
- gymnasium
- matplotlib
- networkx
- requests
- pydantic
+torch
+torchvision
+torchaudio
+numpy
+gymnasium
+matplotlib
+networkx
+requests
+pydantic

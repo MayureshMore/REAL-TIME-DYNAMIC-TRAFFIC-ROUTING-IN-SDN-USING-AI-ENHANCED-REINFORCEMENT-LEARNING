@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 # Ryu app: L2 learning + topology discovery + k-shortest paths + REST + actions
-# Adds: JSON Schema validation, anti-flap cooldown, derived link metrics, OpenAPI route.
-# Run (example):
-#   ryu-manager controller-apps/sdn_router_rest.py ryu.topology.switches --ofp-tcp-listen-port 6633 --wsapi-port 8080
 
 from collections import defaultdict
-import hashlib
-import json
-import time
-
+import hashlib, json, time
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ether_types
 from ryu.lib import hub
-
 from ryu.topology import event as topo_event
 import networkx as nx
-
 from ryu.app.wsgi import WSGIApplication, ControllerBase, route
 from webob import Response
-
 from jsonschema import validate, ValidationError
 
 API_INSTANCE = 'sdn_router_api'
+
+def j(obj, status=200):
+    return Response(content_type='application/json',
+                    body=json.dumps(obj).encode('utf-8'),
+                    status=status)
 
 ROUTE_SCHEMA = {
     "type": "object",
@@ -39,50 +35,35 @@ ROUTE_SCHEMA = {
     "anyOf": [{"required": ["path_id"]}, {"required": ["path"]}]
 }
 
-
 class SDNRouterREST(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _CONTEXTS = {'wsgi': WSGIApplication}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        # Learning-switch state
-        self.mac_to_port = defaultdict(dict)   # dpid -> { mac: port }
-        self.hosts = {}                        # mac -> { 'dpid': dpid, 'port': port }
-
-        # Datapaths
+        self.mac_to_port = defaultdict(dict)
+        self.hosts = {}
         self.datapaths = {}
-
-        # Topology graph
-        self.G = nx.Graph()                    # nodes=dpids, edges carry {u_port,v_port}
+        self.G = nx.Graph()
         self.k_paths_cached = {}
-
-        # Installed routes + cooldowns
-        self.routes = {}            # (src,dst) -> {'cookie', 'path'}
-        self.last_action_ts = {}    # (src,dst) -> float
-        self.route_cooldown = 5.0   # seconds
-
-        # Stats + rates
+        self.routes = {}
+        self.last_action_ts = {}
+        self.route_cooldown = 5.0
         self.port_stats = []
-        self.port_prev = {}         # (dpid,port) -> {'tx_bytes','rx_bytes','tx_pkts','rx_pkts','ts',...}
-        self.port_rates = []        # computed per-second rates
+        self.port_prev = {}
+        self.port_rates = []
         self.flow_stats = []
         self.last_stats_ts = 0.0
         self.monitor_interval = 2
         self.monitor_thread = hub.spawn(self._monitor)
-
-        # REST wiring
         wsgi = kwargs['wsgi']
         wsgi.register(RESTController, {API_INSTANCE: self})
 
-    # ---------- Switch lifecycle ----------
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         dp = ev.msg.datapath
         ofp = dp.ofproto
         parser = dp.ofproto_parser
-        # table-miss to controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -102,7 +83,6 @@ class SDNRouterREST(app_manager.RyuApp):
                 if self.G.has_node(dp.id):
                     self.G.remove_node(dp.id)
 
-    # ---------- Learning switch ----------
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -131,18 +111,15 @@ class SDNRouterREST(app_manager.RyuApp):
         dp.send_msg(parser.OFPPacketOut(datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
                                         in_port=in_port, actions=actions, data=msg.data))
 
-    # ---------- Topology events ----------
     @set_ev_cls(topo_event.EventLinkAdd)
     def link_add_handler(self, ev):
         l = ev.link
         u, v = l.src.dpid, l.dst.dpid
         u_p, v_p = l.src.port_no, l.dst.port_no
-        # directed edges both ways
         self.G.add_edge(u, v, u_port=u_p, v_port=v_p)
         self.G.add_edge(v, u, u_port=v_p, v_port=u_p)
         self.k_paths_cached.clear()
 
-    # ---------- Periodic stats ----------
     def _monitor(self):
         while True:
             try:
@@ -158,8 +135,7 @@ class SDNRouterREST(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
         now = time.time()
-        stats = []
-        rates = []
+        stats, rates = [], []
         for s in ev.msg.body:
             rec = {
                 'timestamp': now, 'dpid': ev.msg.datapath.id, 'port_no': s.port_no,
@@ -181,7 +157,6 @@ class SDNRouterREST(app_manager.RyuApp):
                     'rx_pps': max(0.0, (rec['rx_pkts']  - prev['rx_pkts'])  / dt),
                 })
             self.port_prev[key] = {**rec, 'ts': now}
-        # replace dpid entries
         self.port_stats = [x for x in self.port_stats if x['dpid'] != ev.msg.datapath.id] + stats
         self.port_rates = [x for x in self.port_rates if x['dpid'] != ev.msg.datapath.id] + rates
         self.last_stats_ts = now
@@ -194,13 +169,13 @@ class SDNRouterREST(app_manager.RyuApp):
             flows.append({
                 'timestamp': now, 'dpid': ev.msg.datapath.id,
                 'priority': s.priority, 'table_id': s.table_id,
-                'duration_sec': s.duration_sec, 'packet_count': s.packet_count,
-                'byte_count': s.byte_count, 'match': s.match.to_jsondict(),
+                'duration_sec': getattr(s, 'duration_sec', 0),
+                'packet_count': s.packet_count, 'byte_count': s.byte_count,
+                'match': getattr(s, 'match', None).to_jsondict() if hasattr(s, 'match') else {},
             })
         self.flow_stats = [f for f in self.flow_stats if f['dpid'] != ev.msg.datapath.id] + flows
         self.last_stats_ts = now
 
-    # ---------- Helpers ----------
     def _k_shortest_paths(self, src_dpid, dst_dpid, k=2):
         key = (src_dpid, dst_dpid, k)
         if key in self.k_paths_cached:
@@ -212,8 +187,7 @@ class SDNRouterREST(app_manager.RyuApp):
             paths = []
             for i, p in enumerate(gen):
                 paths.append(p)
-                if i + 1 >= k:
-                    break
+                if i + 1 >= k: break
             self.k_paths_cached[key] = paths
             return paths
         except Exception:
@@ -234,14 +208,13 @@ class SDNRouterREST(app_manager.RyuApp):
 
     def _cookie_for_pair(self, src_mac, dst_mac):
         h = hashlib.md5(f"{src_mac}->{dst_mac}".encode()).hexdigest()
-        return int(h[:16], 16)  # 64-bit cookie
+        return int(h[:16], 16)
 
     def _install_unidirectional_path(self, src_mac, dst_mac, path_dpids, priority=100):
         cookie = self._cookie_for_pair(src_mac, dst_mac)
         for hop in self._path_ports(path_dpids, dst_mac=dst_mac):
             dpid, out_port = hop['dpid'], hop['out_port']
-            if dpid not in self.datapaths:
-                continue
+            if dpid not in self.datapaths: continue
             dp = self.datapaths[dpid]
             parser, ofp = dp.ofproto_parser, dp.ofproto
             actions = [parser.OFPActionOutput(out_port)]
@@ -253,8 +226,8 @@ class SDNRouterREST(app_manager.RyuApp):
         self.routes[(src_mac, dst_mac)] = {'cookie': cookie, 'path': path_dpids}
 
     def _links_with_tx_bps(self):
-        # Build index of tx_bps per (dpid, port)
-        idx = defaultdict(dict)
+        from collections import defaultdict as dd
+        idx = dd(dict)
         for r in self.port_rates:
             idx[r['dpid']][r['port_no']] = r.get('tx_bps', 0.0)
         out = []
@@ -266,30 +239,26 @@ class SDNRouterREST(app_manager.RyuApp):
             })
         return out
 
-
 class RESTController(ControllerBase):
     def __init__(self, req, link, data, **config):
         super().__init__(req, link, data, **config)
         self.app: SDNRouterREST = data[API_INSTANCE]
 
-    # --- Health & Stats ---
     @route('health', '/api/v1/health', methods=['GET'])
     def health(self, req, **kwargs):
-        return Response(content_type='application/json',
-                        body=json.dumps({'status': 'ok', 'last_stats_ts': self.app.last_stats_ts}))
+        return j({'status': 'ok', 'last_stats_ts': self.app.last_stats_ts})
 
     @route('stats_ports', '/api/v1/stats/ports', methods=['GET'])
     def stats_ports(self, req, **kwargs):
-        return Response(content_type='application/json', body=json.dumps(self.app.port_stats))
+        return j(self.app.port_stats)
 
     @route('stats_flows', '/api/v1/stats/flows', methods=['GET'])
     def stats_flows(self, req, **kwargs):
-        return Response(content_type='application/json', body=json.dumps(self.app.flow_stats))
+        return j(self.app.flow_stats)
 
-    # --- Topology & Hosts ---
     @route('topo_nodes', '/api/v1/topology/nodes', methods=['GET'])
     def topo_nodes(self, req, **kwargs):
-        return Response(content_type='application/json', body=json.dumps(list(self.app.G.nodes())))
+        return j(list(self.app.G.nodes()))
 
     @route('topo_links', '/api/v1/topology/links', methods=['GET'])
     def topo_links(self, req, **kwargs):
@@ -297,12 +266,12 @@ class RESTController(ControllerBase):
         for u, v, data in self.app.G.edges(data=True):
             res.append({'src_dpid': u, 'dst_dpid': v,
                         'src_port': data.get('u_port'), 'dst_port': data.get('v_port')})
-        return Response(content_type='application/json', body=json.dumps(res))
+        return j(res)
 
     @route('hosts', '/api/v1/hosts', methods=['GET'])
     def hosts(self, req, **kwargs):
         items = [{'mac': m, 'dpid': inf['dpid'], 'port': inf['port']} for m, inf in self.app.hosts.items()]
-        return Response(content_type='application/json', body=json.dumps(items))
+        return j(items)
 
     @route('paths', '/api/v1/paths', methods=['GET'])
     def paths(self, req, **kwargs):
@@ -310,81 +279,69 @@ class RESTController(ControllerBase):
         src_mac, dst_mac = params.get('src_mac'), params.get('dst_mac')
         k = int(params.get('k', 2))
         if not src_mac or not dst_mac:
-            return Response(status=400, content_type='application/json',
-                            body=json.dumps({'error': 'src_mac and dst_mac required'}))
+            return j({'error': 'src_mac and dst_mac required'}, status=400)
         if src_mac not in self.app.hosts or dst_mac not in self.app.hosts:
-            return Response(status=404, content_type='application/json',
-                            body=json.dumps({'error': 'hosts not yet learned'}))
+            return j({'error': 'hosts not yet learned'}, status=404)
         s, d = self.app.hosts[src_mac]['dpid'], self.app.hosts[dst_mac]['dpid']
         paths = self.app._k_shortest_paths(s, d, k=k)
         out = []
         for i, p in enumerate(paths):
             hops = self.app._path_ports(p, dst_mac=dst_mac)
             out.append({'path_id': i, 'dpids': p, 'hops': hops})
-        return Response(content_type='application/json', body=json.dumps(out))
+        return j(out)
 
-    # --- Actions ---
     @route('route', '/api/v1/actions/route', methods=['POST'])
     def route_action(self, req, **kwargs):
         try:
             data = json.loads(req.body)
             validate(instance=data, schema=ROUTE_SCHEMA)
         except ValidationError as ve:
-            return Response(status=400, content_type='application/json',
-                            body=json.dumps({'error': 'validation_error', 'detail': ve.message}))
+            return j({'error': 'validation_error', 'detail': ve.message}, status=400)
         except Exception:
-            return Response(status=400, content_type='application/json',
-                            body=json.dumps({'error': 'invalid_json'}))
+            return j({'error': 'invalid_json'}, status=400)
 
         src_mac, dst_mac = data['src_mac'], data['dst_mac']
         if src_mac not in self.app.hosts or dst_mac not in self.app.hosts:
-            return Response(status=404, content_type='application/json',
-                            body=json.dumps({'error': 'hosts_not_learned'}))
+            return j({'error': 'hosts_not_learned'}, status=404)
 
-        # Pick path
         chosen = data.get('path')
         if not chosen:
             s, d = self.app.hosts[src_mac]['dpid'], self.app.hosts[dst_mac]['dpid']
             k = int(data.get('k', 2))
             paths = self.app._k_shortest_paths(s, d, k=k)
             if not paths:
-                return Response(status=409, content_type='application/json', body=json.dumps({'error': 'no_path'}))
+                return j({'error': 'no_path'}, status=409)
             idx = int(data.get('path_id', 0))
             idx = 0 if idx < 0 or idx >= len(paths) else idx
             chosen = paths[idx]
 
-        # Cooldown guard
         key = (src_mac, dst_mac)
         now = time.time()
         prev = self.app.routes.get(key, {}).get('path')
         if prev and prev != chosen and (now - self.app.last_action_ts.get(key, 0.0)) < self.app.route_cooldown:
             retry = int(self.app.route_cooldown - (now - self.app.last_action_ts.get(key, 0.0)) + 0.5)
-            return Response(status=429, content_type='application/json',
-                            body=json.dumps({'error': 'cooldown_active', 'retry_after': retry}))
+            return j({'error': 'cooldown_active', 'retry_after': retry}, status=429)
 
-        # Apply both directions
         self.app._install_unidirectional_path(src_mac, dst_mac, chosen)
         self.app._install_unidirectional_path(dst_mac, src_mac, list(reversed(chosen)))
         self.app.last_action_ts[key] = now
-        return Response(content_type='application/json', body=json.dumps({'status': 'applied', 'path': chosen}))
+        return j({'status': 'applied', 'path': chosen})
 
     @route('route_list', '/api/v1/actions/list', methods=['GET'])
     def route_list(self, req, **kwargs):
-        items = []
-        for (src, dst), meta in self.app.routes.items():
-            items.append({'src_mac': src, 'dst_mac': dst, 'cookie': meta['cookie'], 'path': meta['path']})
-        return Response(content_type='application/json', body=json.dumps(items))
+        items = [{'src_mac': src, 'dst_mac': dst, 'cookie': meta['cookie'], 'path': meta['path']}
+                 for (src, dst), meta in self.app.routes.items()]
+        return j(items)
 
     @route('route_delete', '/api/v1/actions/route', methods=['DELETE'])
     def route_delete(self, req, **kwargs):
         params = req.params
         src_mac, dst_mac = params.get('src_mac'), params.get('dst_mac')
         if not src_mac or not dst_mac:
-            return Response(status=400, content_type='application/json',
-                            body=json.dumps({'error': 'src_mac and dst_mac required'}))
+            return j({'error': 'src_mac and dst_mac required'}, status=400)
         key = (src_mac, dst_mac)
         if key not in self.app.routes:
-            return Response(status=404, content_type='application/json', body=json.dumps({'error': 'not_found'}))
+            return j({'error': 'not_found'}, status=404)
         cookie = self.app.routes[key]['cookie']
         mask = 0xFFFFFFFFFFFFFFFF
         count = 0
@@ -396,19 +353,17 @@ class RESTController(ControllerBase):
             dp.send_msg(mod)
             count += 1
         del self.app.routes[key]
-        return Response(content_type='application/json', body=json.dumps({'status': 'deleted', 'affected_dpids': count}))
+        return j({'status': 'deleted', 'affected_dpids': count})
 
-    # --- Derived metrics & OpenAPI ---
     @route('link_metrics', '/api/v1/metrics/links', methods=['GET'])
     def link_metrics(self, req, **kwargs):
-        return Response(content_type='application/json', body=json.dumps(self.app._links_with_tx_bps()))
+        return j(self.app._links_with_tx_bps())
 
     @route('openapi', '/api/v1/openapi.yaml', methods=['GET'])
     def openapi(self, req, **kwargs):
         try:
-            with open('docs/openapi.yaml', 'r') as f:
+            with open('docs/openapi.yaml', 'rb') as f:
                 spec = f.read()
             return Response(content_type='application/yaml', body=spec)
         except Exception as e:
-            return Response(status=500, content_type='application/json',
-                            body=json.dumps({'error': 'openapi_not_found', 'detail': str(e)}))
+            return j({'error': 'openapi_not_found', 'detail': str(e)}, status=500)

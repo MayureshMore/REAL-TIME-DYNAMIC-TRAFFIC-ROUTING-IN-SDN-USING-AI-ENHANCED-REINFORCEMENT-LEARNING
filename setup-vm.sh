@@ -102,4 +102,5 @@ io.open(p, 'w', encoding='utf-8').write(src)
 print("Patched:", p)
 PY
 
-echo "==> Done. Next: ./run-controller.sh (optionally: ./run-controller.sh smoke)"
+echo "==> Done. Next: ./run-controller.sh   (or: WSAPI_PORT=8080 OF_PORT=6633 ./scripts/run_ryu.sh)"
+
