@@ -1,68 +1,103 @@
-# controller-apps/monitor_rest.py
-for stat in ev.msg.body:
-# Skip local ports if desired (port_no == ofproto.OFPP_LOCAL)
-stats.append({
-    'timestamp': now,
-    'dpid': ev.msg.datapath.id,
-    'port_no': stat.port_no,
-    'rx_pkts': stat.rx_packets,
-    'tx_pkts': stat.tx_packets,
-    'rx_bytes': stat.rx_bytes,
-    'tx_bytes': stat.tx_bytes,
-    'rx_dropped': stat.rx_dropped,
-    'tx_dropped': stat.tx_dropped,
-    'rx_errors': stat.rx_errors,
-    'tx_errors': stat.tx_errors,
-})
-# Replace snapshot for this dpid (simple strategy)
-# Keep only last N seconds by timestamp if you want rolling window; for now, overwrite entire list
-# Group per dpid and merge into single list
-# For simplicity here, just append and trim last snapshot timestamp
-self.port_stats = [s for s in self.port_stats if s.get('dpid') != ev.msg.datapath.id]
-self.port_stats.extend(stats)
-self.last_stats_ts = now
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib import hub
+from ryu.app.wsgi import ControllerBase, WSGIApplication, route
+from webob import Response
+import json, time
 
+def j(obj, status=200):
+    return Response(
+        content_type='application/json',
+        body=json.dumps(obj).encode('utf-8'),
+        status=status
+    )
 
-@set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-def flow_stats_reply_handler(self, ev):
-    now = time.time()
-flows = []
-for stat in ev.msg.body:
-    match = stat.match.to_jsondict().get('OFPMatch', {}).get('oxm_fields', [])
-flows.append({
-    'timestamp': now,
-    'dpid': ev.msg.datapath.id,
-    'priority': stat.priority,
-    'table_id': stat.table_id,
-    'duration_sec': stat.duration_sec,
-    'packet_count': stat.packet_count,
-    'byte_count': stat.byte_count,
-    'match': match,
-})
-self.flow_stats = [f for f in self.flow_stats if f.get('dpid') != ev.msg.datapath.id]
-self.flow_stats.extend(flows)
-self.last_stats_ts = now
+class MonitorRest(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'wsgi': WSGIApplication}
 
+    def __init__(self, *args, **kwargs):
+        super(MonitorRest, self).__init__(*args, **kwargs)
+        self.datapaths = {}
+        self.latest_ports = []
+        self.latest_flows = []
+        self.last_stats_ts = 0.0
+        self.monitor_thread = hub.spawn(self._monitor)
+        wsgi = kwargs['wsgi']
+        wsgi.register(StatsController, {'app': self})
 
+    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def _state_change_handler(self, ev):
+        dp = ev.datapath
+        if ev.state == MAIN_DISPATCHER:
+            self.datapaths[dp.id] = dp
+            self.logger.info('DP joined: %016x', dp.id)
+        elif ev.state == DEAD_DISPATCHER:
+            self.datapaths.pop(dp.id, None)
+            self.logger.info('DP left: %016x', dp.id)
 
+    def _monitor(self):
+        while True:
+            for dp in list(self.datapaths.values()):
+                ofp = dp.ofproto
+                parser = dp.ofproto_parser
+                dp.send_msg(parser.OFPPortStatsRequest(dp, 0, ofp.OFPP_ANY))
+                dp.send_msg(parser.OFPFlowStatsRequest(dp))
+            hub.sleep(2)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        ts = time.time()
+        self.last_stats_ts = ts
+        stats = []
+        for s in ev.msg.body:
+            stats.append({
+                'timestamp': ts, 'dpid': ev.msg.datapath.id, 'port_no': s.port_no,
+                'rx_pkts': s.rx_packets, 'tx_pkts': s.tx_packets,
+                'rx_bytes': s.rx_bytes, 'tx_bytes': s.tx_bytes,
+                'rx_dropped': s.rx_dropped, 'tx_dropped': s.tx_dropped,
+                'rx_errors': s.rx_errors, 'tx_errors': s.tx_errors
+            })
+        self.latest_ports = stats
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply_handler(self, ev):
+        ts = time.time()
+        self.last_stats_ts = ts
+        flows = []
+        for s in ev.msg.body:
+            match_kv = []
+            m = getattr(s, 'match', None)
+            try:
+                if m and hasattr(m, 'items'):
+                    for k, v in m.items():
+                        match_kv.append({'field': k, 'value': v})
+            except Exception:
+                pass
+            flows.append({
+                'timestamp': ts, 'dpid': ev.msg.datapath.id,
+                'priority': s.priority, 'table_id': s.table_id,
+                'duration_sec': getattr(s, 'duration_sec', 0),
+                'packet_count': s.packet_count, 'byte_count': s.byte_count,
+                'match': match_kv
+            })
+        self.latest_flows = flows
 
 class StatsController(ControllerBase):
     def __init__(self, req, link, data, **config):
-    super().__init__(req, link, data, **config)
-self.app = data[API_INSTANCE_NAME]
+        super(StatsController, self).__init__(req, link, data, **config)
+        self.app = data['app']
 
+    @route('health', '/api/v1/health', methods=['GET'])
+    def health(self, req, **kwargs):
+        return j({'status': 'ok', 'last_stats_ts': self.app.last_stats_ts})
 
-@route('health', '/api/v1/health', methods=['GET'])
-def health(self, req, **kwargs):
-    body = {'status': 'ok', 'last_stats_ts': self.app.last_stats_ts}
-return Response(content_type='application/json', body=json.dumps(body))
+    @route('ports', '/api/v1/stats/ports', methods=['GET'])
+    def ports(self, req, **kwargs):
+        return j(self.app.latest_ports)
 
-
-@route('stats_ports', '/api/v1/stats/ports', methods=['GET'])
-def stats_ports(self, req, **kwargs):
-    return Response(content_type='application/json', body=json.dumps(self.app.port_stats))
-
-
-@route('stats_flows', '/api/v1/stats/flows', methods=['GET'])
-def stats_flows(self, req, **kwargs):
-    return Response(content_type='application/json', body=json.dumps(self.app.flow_stats))
+    @route('flows', '/api/v1/stats/flows', methods=['GET'])
+    def flows(self, req, **kwargs):
+        return j(self.app.latest_flows)
