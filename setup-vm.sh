@@ -74,6 +74,11 @@ if [[ ! -f "${APP}" ]]; then
 fi
 
 # Replace the health() body to ensure WebOb gets bytes (avoids charset TypeError)
+pyenv global 3.9.19
+pyenv local 3.9.19
+pyenv rehash
+sudo dpkg --configure -a
+
 python - "$APP" <<'PY'
 import io, os, re, sys
 p = sys.argv[1]
