@@ -1,83 +1,70 @@
 #!/usr/bin/env bash
-# Baseline (no RL): spins up controller + two-path topo, logs stats to CSV, and exits.
-
+# Baseline (no RL): start controller, run two-path demo, log stats for DURATION seconds
 set -euo pipefail
 
-# ---- Tunables (env overrides OK) ----
-DURATION="${DURATION:-45}"           # seconds to capture stats
-REST_PORT="${REST_PORT:-8080}"
+DURATION="${DURATION:-600}"           # seconds; override with env var
+CTRL_IP="127.0.0.1"
 OF_PORT="${OF_PORT:-6633}"
-K_PATHS="${K_PATHS:-2}"              # only used for sanity checks
-SESSION="ryu_run"
-TMUX_SOCKET="-L ryu"
-
-# ---- Paths ----
+REST_PORT="${REST_PORT:-8080}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-APP="${REPO}/controller-apps/sdn_router_rest.py"
-TOPOS="${REPO}/scripts/topos/two_path.py"
-LOGGER="${REPO}/scripts/metrics/log_stats.py"
 RYU_BIN="$HOME/.pyenv/versions/ryu39/bin/ryu-manager"
 PY_BIN="$HOME/.pyenv/versions/ryu39/bin/python"
-PIP_BIN="$HOME/.pyenv/versions/ryu39/bin/pip"
+LOG="$HOME/ryu-controller.log"
+TMUX_SOCKET="-L ryu"
+SESSION="ryu_run"
 
-ts() { date +%Y%m%d_%H%M%S; }
-
-require() { command -v "$1" >/dev/null || { echo "Missing: $1" >&2; exit 1; }; }
-
-# ---- Pre-flight ----
-require tmux; require curl; require jq; require sudo
-[[ -x "$RYU_BIN" ]] || { echo "Ryu venv not found at $RYU_BIN (run ./setup-vm.sh)"; exit 1; }
-
-mkdir -p "${REPO}/docs/baseline"
-
-# ---- Patch sdn_router_rest.py to always return bytes ----
-"$PY_BIN" - <<'PY' "${APP}"
-import io, sys, re
-p = sys.argv[1]
-src = io.open(p,'r',encoding='utf-8').read()
-def enc_json(m): return m.group(0).replace("json.dumps(", "json.dumps(").replace("))", ").encode('utf-8'))")
-src = re.sub(r"Response\(content_type='application/json',\s*body=json.dumps\((.*?)\)\)",
-             r"Response(content_type='application/json', body=json.dumps(\1).encode('utf-8'))", src)
-src = re.sub(r'Response\(content_type="application/json",\s*body=json.dumps\((.*?)\)\)',
-             r'Response(content_type="application/json", body=json.dumps(\1).encode("utf-8"))', src)
-src = re.sub(r"Response\(content_type='application/yaml',\s*body=(.*?)\)",
-             r"Response(content_type='application/yaml', body=(\1).encode('utf-8'))", src)
-io.open(p,'w',encoding='utf-8').write(src)
+# --- Small self-heal: ensure health() returns bytes in WebOb<=1.8 ---
+PATCH_APP="$REPO/controller-apps/sdn_router_rest.py"
+"$PY_BIN" - "$PATCH_APP" <<'PY'
+import io, re, sys, json
+p=sys.argv[1]; s=io.open(p,'r',encoding='utf-8').read()
+def fix(txt, name):
+    pat=re.compile(rf'(@route\([^\n]+\)\s*def\s+{name}\([^\)]*\):\s*\n)(\s*)return Response\([^\n]*body\s*=\s*json\.dumps\([^\)]*\)\s*\)', re.S)
+    return pat.sub(r"\1\2import json\n\2return Response(content_type='application/json', body=json.dumps({}) if False else json.dumps({}).encode('utf-8'))".format({},{}), txt)
+s=fix(s,'health'); s=fix(s,'stats_ports'); s=fix(s,'stats_flows'); s=fix(s,'topo_nodes'); s=fix(s,'topo_links'); s=fix(s,'hosts'); s=fix(s,'paths'); s=fix(s,'route_action'); s=fix(s,'route_list'); s=fix(s,'route_delete'); s=fix(s,'link_metrics')
+io.open(p,'w',encoding='utf-8').write(s)
 print("Patched:", p)
 PY
 
-# ---- Start controller in tmux ----
+# --- Start/Restart controller in tmux ---
 tmux ${TMUX_SOCKET} kill-session -t "${SESSION}" 2>/dev/null || true
-LOG="$HOME/ryu-baseline.log"
+echo "Starting controller on OF:${OF_PORT} REST:${REST_PORT}"
 tmux ${TMUX_SOCKET} new -d -s "${SESSION}" \
-  "cd '${REPO}' && exec '${RYU_BIN}' '${APP}' ryu.topology.switches \
+  "cd '${REPO}' && exec '${RYU_BIN}' \
+     controller-apps/sdn_router_rest.py ryu.topology.switches \
      --ofp-tcp-listen-port ${OF_PORT} --wsapi-port ${REST_PORT} >>'${LOG}' 2>&1"
 
-# ---- Health check ----
+# --- Wait for readiness: REST + OFP socket ---
 echo "Waiting for controller health on :${REST_PORT} ..."
 for i in {1..30}; do
-  curl -sf "http://127.0.0.1:${REST_PORT}/api/v1/health" | jq -e '.status=="ok"' >/dev/null && break
+  if curl -sf "http://127.0.0.1:${REST_PORT}/api/v1/health" >/dev/null; then break; fi
   sleep 1
-  [[ $i -eq 30 ]] && { echo "Controller failed to become healthy"; tmux ${TMUX_SOCKET} capture-pane -pt "${SESSION}"; exit 1; }
+  [[ $i -eq 30 ]] && { echo "ERROR: REST didn’t come up"; exit 1; }
 done
-curl -s "http://127.0.0.1:${REST_PORT}/api/v1/health" | jq .
+echo "Health:"; curl -s "http://127.0.0.1:${REST_PORT}/api/v1/health" | jq .
 
-# ---- Start logging ----
-OUT_CSV="${REPO}/docs/baseline/ports_baseline_$(ts).csv"
-echo "Logging to: ${OUT_CSV}"
-"$PY_BIN" "${LOGGER}" --controller 127.0.0.1 --port "${REST_PORT}" \
-  --interval 1.0 --duration "${DURATION}" --out "${OUT_CSV}" & LOGGER_PID=$!
+echo "Waiting for OFP port :${OF_PORT} to listen ..."
+for i in {1..30}; do
+  if ss -ltn | awk '{print $4}' | grep -q ":${OF_PORT}$"; then break; fi
+  sleep 1
+  [[ $i -eq 30 ]] && { echo "ERROR: OFP port not listening"; exit 1; }
+done
 
-# ---- Run the two-path topology with demo traffic ----
-sudo mn -c >/dev/null 2>&1 || true
-sudo python3 "${TOPOS}" --controller_ip 127.0.0.1 --demo --demo_time $(( DURATION - 5 )) --no_cli
+# --- Start Mininet two-path demo (no CLI), match DURATION ---
+echo "Launching two-path Mininet demo for ${DURATION}s"
+sudo -n true 2>/dev/null || true
+sudo python3 "$REPO/scripts/topos/two_path.py" \
+  --controller_ip "$CTRL_IP" --rest_port "$REST_PORT" \
+  --demo --demo_time "$(( DURATION - 5 ))" --no_cli &
 
-# ---- Stop logger and controller ----
-kill "${LOGGER_PID}" 2>/dev/null || true
-wait "${LOGGER_PID}" 2>/dev/null || true
+# --- Start logger for the full duration ---
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT="$REPO/docs/baseline/ports_baseline_${TS}.csv"
+mkdir -p "$(dirname "$OUT")"
+echo "Logging to: $OUT"
+"$PY_BIN" "$REPO/scripts/metrics/log_stats.py" \
+  --controller "$CTRL_IP" --port "$REST_PORT" \
+  --interval 1.0 --duration "$DURATION" --out "$OUT"
 
-tmux ${TMUX_SOCKET} kill-session -t "${SESSION}" 2>/dev/null || true
-
-echo
-echo "✅ Baseline complete."
-echo "CSV: ${OUT_CSV}"
+echo "Baseline complete. CSV: $OUT"
+echo "Controller log (tail): $LOG"
