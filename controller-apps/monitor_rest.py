@@ -103,6 +103,7 @@ class StatsController(ControllerBase):
 
         return Response(content_type="application/json", body=payload.encode("utf-8"))
 
+
     def ports(self, req, **kwargs):
         return j(self.app.latest_ports)
 

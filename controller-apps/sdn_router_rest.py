@@ -364,6 +364,6 @@ class RESTController(ControllerBase):
         try:
             with open('docs/openapi.yaml', 'rb') as f:
                 spec = f.read()
-            return Response(content_type='application/yaml', body=spec)
+            return Response(content_type='application/yaml', body=((spec).encode('utf-8')).encode('utf-8'))
         except Exception as e:
             return j({'error': 'openapi_not_found', 'detail': str(e)}, status=500)
