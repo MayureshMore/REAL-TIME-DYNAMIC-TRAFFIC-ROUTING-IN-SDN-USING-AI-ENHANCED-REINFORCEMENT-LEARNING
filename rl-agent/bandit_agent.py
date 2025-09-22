@@ -10,7 +10,6 @@ Hardened to:
 - Treat 409 (no_path) and 429 (cooldown) as transient and retry
 """
 
-from __future__ import annotations
 import argparse, time, random, sys
 from typing import Optional, List, Dict, Any
 from collections import defaultdict
@@ -74,7 +73,6 @@ def safe_post_route(base: str, src_mac: str, dst_mac: str, **kw) -> Optional[Any
             time.sleep(max(1, retry_after))
             return None
         if code == 409:
-            # Controller says no path yet (topology/hosts not ready) — transient
             print("[agent] No path available yet (409). Will retry...", flush=True)
             time.sleep(2.0)
             return None
@@ -82,13 +80,13 @@ def safe_post_route(base: str, src_mac: str, dst_mac: str, **kw) -> Optional[Any
 
 PortIndex = Dict[int, Dict[int, dict]]
 def index_ports(snapshot: List[dict]) -> PortIndex:
-    idx: PortIndex = defaultdict(dict)
+    idx: PortIndex = defaultdict(dict)  # type: ignore[name-defined]
     for p in snapshot:
         try: idx[int(p['dpid'])][int(p['port_no'])] = p
         except Exception: continue
-    return idx
+    return idx  # type: ignore[return-value]
 
-def aggregate_counters(idx: PortIndex, hops: List[dict]) -> Dict[str, float]:
+def aggregate_counters(idx: Dict[int, Dict[int, dict]], hops: List[dict]) -> Dict[str, float]:
     agg = {'rx_bytes':0.0,'tx_bytes':0.0,'rx_pkts':0.0,'tx_pkts':0.0,'rx_dropped':0.0,'tx_dropped':0.0,'rx_errors':0.0,'tx_errors':0.0}
     for h in hops:
         dpid = int(h.get('dpid', -1)); outp = int(h.get('out_port', -1))
@@ -120,7 +118,7 @@ def choose_path(q: Dict[int,float], num_arms: int, epsilon: float) -> int:
 
 def wait_for_hosts_and_paths(base: str, k: int, timeout: float) -> tuple[str,str,List[dict]]:
     t0 = time.time()
-    src_mac = dst_mac = None
+    src_mac = dst_mac = None  # type: ignore[assignment]
     while True:
         hosts = get_hosts(base)
         if len(hosts) >= 2:
@@ -169,7 +167,6 @@ def main() -> int:
             print("[agent] No valid paths yet; retrying...", flush=True)
             time.sleep(2.0)
         if not paths:
-            # give up this tick gracefully
             time.sleep(3.0)
             continue
 
