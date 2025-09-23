@@ -99,8 +99,9 @@ class SDNRouterREST(app_manager.RyuApp):
         src = eth.src
         dst = eth.dst
 
-        self.mac_to_port[dpid][src] = in_port
-        self.hosts[src] = {'dpid': dpid, 'port': in_port}
+        if in_port not in self.core_ports.get(dpid, set()):
+            self.mac_to_port[dpid][src] = in_port
+            self.hosts[src] = {'dpid': dpid, 'port': in_port}
 
         out_port = self.mac_to_port[dpid].get(dst, ofp.OFPP_FLOOD)
         actions = [parser.OFPActionOutput(out_port)]

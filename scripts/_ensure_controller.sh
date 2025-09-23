@@ -1,54 +1,38 @@
-cat > scripts/_ensure_controller.sh <<'SH'
 #!/usr/bin/env bash
+# Start Ryu with the SDN router REST app + topology discovery in a tmux session.
 set -euo pipefail
-
-OF_PORT="${1:-6633}"
-REST_PORT="${2:-8080}"
-
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYENV_ROOT="${HOME}/.pyenv"
 RYU_BIN="${PYENV_ROOT}/versions/ryu39/bin/ryu-manager"
 LOG="${HOME}/ryu-controller.log"
-SESSION="ryu-app"
+OF_PORT="${1:-6633}"
+WSAPI_PORT="${2:-8080}"
 TMUX_SOCKET="-L ryu"
+SESSION="ryu-app"
 
-if [[ ! -x "${RYU_BIN}" ]]; then
-  echo "Ryu venv missing at ${RYU_BIN}. Run ./setup-vm.sh first." >&2
-  exit 1
-fi
-
-# Kill any previous controller session
 tmux ${TMUX_SOCKET} kill-session -t "${SESSION}" 2>/dev/null || true
 
-echo "Starting controller on OF:${OF_PORT} REST:${REST_PORT}"
+echo "Starting controller on OF:${OF_PORT} REST:${WSAPI_PORT}"
 tmux ${TMUX_SOCKET} new -d -s "${SESSION}" \
-  "cd '${REPO}' && \
-   export PYTHONUNBUFFERED=1 && \
-   exec '${RYU_BIN}' \
-     controller-apps/monitor_rest.py \
-     controller-apps/sdn_router_rest.py \
-     ryu.topology.switches \
-     --ofp-tcp-listen-port ${OF_PORT} \
-     --wsapi-port ${REST_PORT} >>'${LOG}' 2>&1"
+  "cd '${REPO}' && exec '${RYU_BIN}' \
+     '${REPO}/controller-apps/sdn_router_rest.py' ryu.topology.switches \
+     --ofp-tcp-listen-port ${OF_PORT} --wsapi-port ${WSAPI_PORT} >>'${LOG}' 2>&1"
 
-# Health check
-echo "Waiting for controller health on :${REST_PORT} ..."
-for i in {1..40}; do
-  if curl -sf "http://127.0.0.1:${REST_PORT}/api/v1/health" >/dev/null; then
-    echo "Health:"; curl -s "http://127.0.0.1:${REST_PORT}/api/v1/health" | jq .
-    break
-  fi
-  sleep 1
-  [[ $i -eq 40 ]] && { echo "Controller failed health check"; tail -n 200 "${LOG}" || true; exit 1; }
-done
-
-# OF port listen check (best effort)
-echo "Waiting for OFP port :${OF_PORT} to listen ..."
+# Wait for REST health
+echo -n "Waiting for controller health on :${WSAPI_PORT} ... "
 for i in {1..30}; do
-  ss -ltn | grep -q ":${OF_PORT} " && break || true
+  if curl -sf "http://127.0.0.1:${WSAPI_PORT}/api/v1/health" >/dev/null; then echo "OK"; break; fi
   sleep 1
+  [[ $i -eq 30 ]] && { echo "FAIL"; tail -n 200 "${LOG}"; exit 1; }
 done
 
-exit 0
-SH
-chmod +x scripts/_ensure_controller.sh
+# Wait for OF port to be listening
+echo -n "Waiting for OFP port :${OF_PORT} to listen ... "
+for i in {1..30}; do
+  ss -ltn sport = :${OF_PORT} | grep -q LISTEN && { echo "OK"; break; }
+  sleep 1
+  [[ $i -eq 30 ]] && { echo "FAIL"; tail -n 200 "${LOG}"; exit 1; }
+done
+
+echo "Health:"
+curl -s "http://127.0.0.1:${WSAPI_PORT}/api/v1/health" | jq .
