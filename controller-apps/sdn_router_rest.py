@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Ryu app: L2 learning + topology discovery + k-shortest paths + REST + actions
-# Fixes:
-# - Track "core" (inter-switch) ports and never learn hosts on them
-# - Periodic sweeper to purge any host entries that land on core ports
-# - Use a DiGraph so link attributes are directional (u_port, v_port)
-# - Return only real multi-switch paths (len(dpids) >= 2)
-# - Robust, byte-safe JSON responses and OpenAPI handler
+# Key fixes in this version:
+# - Learn hosts on any non-core port even before topology is known (break bootstrapping deadlock)
+# - When a port later becomes core (via LLDP link discovery), purge any host learned there
+# - Directed topology (DiGraph) so each edge carries correct per-direction port metadata
+# - Only return multi-switch paths (len(dpids) >= 2)
+# - Robust JSON responses and OpenAPI handler
 
 from collections import defaultdict
 import hashlib, json, time
@@ -47,25 +47,30 @@ class SDNRouterREST(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # L2 learning + host table
+        # L2 learning & host table
         self.mac_to_port = defaultdict(dict)        # dpid -> {mac: port}
         self.hosts = {}                              # mac -> {dpid, port}
-        # Switches and links (directional for port attributes)
+
+        # Switches and links (directed graph)
         self.datapaths = {}
         self.G = nx.DiGraph()
+
         # Inter-switch (core) ports per switch
         self.core_ports = defaultdict(set)           # dpid -> {port_no}
+
         # Path/service state
         self.k_paths_cached = {}
         self.routes = {}                             # (src,dst) -> {cookie, path}
         self.last_action_ts = {}
         self.route_cooldown = 5.0
+
         # Stats
         self.port_stats = []
         self.port_prev = {}
         self.port_rates = []
         self.flow_stats = []
         self.last_stats_ts = 0.0
+
         # Background workers
         self.monitor_interval = 2
         self.monitor_thread = hub.spawn(self._monitor)
@@ -82,6 +87,7 @@ class SDNRouterREST(app_manager.RyuApp):
         dp = ev.msg.datapath
         ofp = dp.ofproto
         parser = dp.ofproto_parser
+        # Table-miss to controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -100,9 +106,7 @@ class SDNRouterREST(app_manager.RyuApp):
                 del self.datapaths[dp.id]
                 if self.G.has_node(dp.id):
                     self.G.remove_node(dp.id)
-                # Clean up any core port bookkeeping
                 self.core_ports.pop(dp.id, None)
-                # Drop related cached paths
                 self.k_paths_cached = {k:v for k,v in self.k_paths_cached.items()
                                        if dp.id not in (k[0], k[1])}
 
@@ -145,8 +149,8 @@ class SDNRouterREST(app_manager.RyuApp):
         src = eth.src
         dst = eth.dst
 
-        # Learn only on non-core (edge) ports AND only after we know core ports on this switch
-        if len(self.core_ports.get(dpid, set())) > 0 and in_port not in self.core_ports.get(dpid, set()):
+        # FIX: learn on any non-core port (even if we don't yet know core ports on this switch)
+        if in_port not in self.core_ports.get(dpid, set()):
             self.mac_to_port[dpid][src] = in_port
             self.hosts[src] = {'dpid': dpid, 'port': in_port}
 
@@ -175,11 +179,9 @@ class SDNRouterREST(app_manager.RyuApp):
         self.G.add_edge(u, v, u_port=u_p, v_port=v_p)
         self.G.add_edge(v, u, u_port=v_p, v_port=u_p)
 
-        # Mark inter-switch ports as core on both ends
+        # Mark inter-switch ports as core on both ends and purge any hosts there
         self._mark_core_port(u, u_p, True)
         self._mark_core_port(v, v_p, True)
-
-        # Any host mistakenly learned on those ports gets purged
         self._purge_hosts_on_port(u, u_p)
         self._purge_hosts_on_port(v, v_p)
 
@@ -192,7 +194,6 @@ class SDNRouterREST(app_manager.RyuApp):
         u_p, v_p = l.src.port_no, l.dst.port_no
         if self.G.has_edge(u, v): self.G.remove_edge(u, v)
         if self.G.has_edge(v, u): self.G.remove_edge(v, u)
-        # Unmark core on the specific ports (topology changed)
         self._mark_core_port(u, u_p, False)
         self._mark_core_port(v, v_p, False)
         self.k_paths_cached.clear()
