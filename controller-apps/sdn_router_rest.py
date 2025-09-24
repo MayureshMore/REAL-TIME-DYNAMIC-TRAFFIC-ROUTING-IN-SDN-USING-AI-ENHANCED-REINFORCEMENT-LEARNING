@@ -42,18 +42,16 @@ class SDNRouterREST(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.mac_to_port = defaultdict(dict)
-        self.core_ports = defaultdict(set)       # ports used for inter-switch links
-        self.hosts = {}
+        self.core_ports = defaultdict(set)       # inter-switch ports
+        self.hosts = {}                          # mac -> {dpid, port}
         self.datapaths = {}
-        self.G = nx.Graph()
+        self.G = nx.DiGraph()                    # directed for per-port metadata
         self.k_paths_cached = {}
         self.routes = {}
         self.last_action_ts = {}
         self.route_cooldown = 5.0
-        self.port_stats = []
+        self.port_stats, self.port_rates, self.flow_stats = [], [], []
         self.port_prev = {}
-        self.port_rates = []
-        self.flow_stats = []
         self.last_stats_ts = 0.0
         self.monitor_interval = 2
         self.monitor_thread = hub.spawn(self._monitor)
@@ -119,10 +117,15 @@ class SDNRouterREST(app_manager.RyuApp):
         l = ev.link
         u, v = l.src.dpid, l.dst.dpid
         u_p, v_p = l.src.port_no, l.dst.port_no
+        # record directed edges with port metadata
         self.G.add_edge(u, v, u_port=u_p, v_port=v_p)
         self.G.add_edge(v, u, u_port=v_p, v_port=u_p)
+        # mark core ports
         self.core_ports[u].add(u_p)
         self.core_ports[v].add(v_p)
+        # purge any hosts accidentally learned on these core ports
+        self._purge_hosts_on_port(u, u_p)
+        self._purge_hosts_on_port(v, v_p)
         self.k_paths_cached.clear()
 
     @set_ev_cls(topo_event.EventLinkDelete)
@@ -135,6 +138,16 @@ class SDNRouterREST(app_manager.RyuApp):
         self.core_ports[u].discard(u_p)
         self.core_ports[v].discard(v_p)
         self.k_paths_cached.clear()
+
+    def _purge_hosts_on_port(self, dpid, port_no):
+        # remove from mac_to_port
+        for mac, p in list(self.mac_to_port.get(dpid, {}).items()):
+            if p == port_no:
+                self.mac_to_port[dpid].pop(mac, None)
+        # remove from hosts dict
+        for mac, inf in list(self.hosts.items()):
+            if inf.get('dpid') == dpid and inf.get('port') == port_no:
+                self.hosts.pop(mac, None)
 
     def _monitor(self):
         while True:
@@ -183,7 +196,7 @@ class SDNRouterREST(app_manager.RyuApp):
         flows = []
         for s in ev.msg.body:
             flows.append({
-                'timestamp': now, 'dpid': ev.msg.datapath.id,
+                'timestamp': now, 'dpid': ev.msg.datapapth.id if False else ev.msg.datapath.id,
                 'priority': s.priority, 'table_id': s.table_id,
                 'duration_sec': getattr(s, 'duration_sec', 0),
                 'packet_count': s.packet_count, 'byte_count': s.byte_count,
@@ -287,6 +300,8 @@ class RESTController(ControllerBase):
     @route('hosts', '/api/v1/hosts', methods=['GET'])
     def hosts(self, req, **kwargs):
         items = [{'mac': m, 'dpid': inf['dpid'], 'port': inf['port']} for m, inf in self.app.hosts.items()]
+        # deterministic order helps tooling pick consistently
+        items.sort(key=lambda x: (x['dpid'], x['port'], x['mac']))
         return j(items)
 
     @route('paths', '/api/v1/paths', methods=['GET'])
@@ -299,7 +314,7 @@ class RESTController(ControllerBase):
         if src_mac not in self.app.hosts or dst_mac not in self.app.hosts:
             return j({'error': 'hosts not yet learned'}, status=404)
         s, d = self.app.hosts[src_mac]['dpid'], self.app.hosts[dst_mac]['dpid']
-        paths = self.app._k_shortest_paths(s, d, k=k)
+        paths = [p for p in self.app._k_shortest_paths(s, d, k=k) if len(p) >= 2]
         out = []
         for i, p in enumerate(paths):
             hops = self.app._path_ports(p, dst_mac=dst_mac)
@@ -324,7 +339,7 @@ class RESTController(ControllerBase):
         if not chosen:
             s, d = self.app.hosts[src_mac]['dpid'], self.app.hosts[dst_mac]['dpid']
             k = int(data.get('k', 2))
-            paths = self.app._k_shortest_paths(s, d, k=k)
+            paths = [p for p in self.app._k_shortest_paths(s, d, k=k) if len(p) >= 2]
             if not paths:
                 return j({'error': 'no_path'}, status=409)
             idx = int(data.get('path_id', 0))

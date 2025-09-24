@@ -22,19 +22,39 @@ sudo python3 "$REPO/scripts/topos/two_path.py" \
   --controller_ip "$CTRL" --rest_port "$REST_PORT" \
   --demo --demo_time "$((DURATION-5))" --no_cli &
 
-# Wait for hosts+paths before agent & logger
+# Wait for EDGE hosts + valid paths before agent & logger
 BASE="http://127.0.0.1:${REST_PORT}/api/v1"
 echo "Waiting up to ${WAIT_FOR_PATHS}s for hosts & paths..."
 t0=$(date +%s)
+SRC=""; DST=""
+
 while :; do
-  if curl -sf "${BASE}/hosts" | jq -e 'length >= 2' >/dev/null 2>&1; then
-    SRC=$(curl -s "${BASE}/hosts" | jq -r '.[0].mac')
-    DST=$(curl -s "${BASE}/hosts" | jq -r '.[1].mac')
-    if curl -sf "${BASE}/paths?src_mac=${SRC}&dst_mac=${DST}&k=${K}" | jq -e 'length >= 1' >/dev/null 2>&1; then
+  HOSTS="$(curl -sf "${BASE}/hosts" || echo '[]')"
+  LINKS="$(curl -sf "${BASE}/topology/links" || echo '[]')"
+
+  # Build set of core (dpid:port)
+  CORE_JSON=$(jq -c '[ .[] | "\(.src_dpid):\(.src_port)", "\(.dst_dpid):\(.dst_port)" ] | unique' <<< "${LINKS}")
+  # Filter to edge hosts only, deterministic order, prefer 00:* style
+  EDGE="$(jq -c --argjson core "${CORE_JSON}" '
+      [ .[]
+        | select(((("\(.dpid):\(.port)") as $k | ($core | index($k))) | not))
+      ]
+      | sort_by((.mac|startswith("00")|not), .dpid, .port, .mac)
+    ' <<< "${HOSTS}")"
+
+  CNT="$(jq 'length' <<< "${EDGE}")"
+  if [[ "${CNT}" -ge 2 ]]; then
+    SRC="$(jq -r '.[0].mac' <<< "${EDGE}")"
+    DST="$(jq -r '.[1].mac' <<< "${EDGE}")"
+    # Validate at least one path with dpids length >= 2
+    if curl -sf "${BASE}/paths?src_mac=${SRC}&dst_mac=${DST}&k=${K}" \
+      | jq -e '[.[] | select(.dpids|length>=2)] | length >= 1' >/dev/null; then
       break
     fi
   fi
-  now=$(date +%s); (( now - t0 > WAIT_FOR_PATHS )) && { echo "Timed out waiting for paths"; break; }
+
+  now=$(date +%s)
+  (( now - t0 > WAIT_FOR_PATHS )) && { echo "Timed out waiting for paths"; break; }
   sleep 2
 done
 

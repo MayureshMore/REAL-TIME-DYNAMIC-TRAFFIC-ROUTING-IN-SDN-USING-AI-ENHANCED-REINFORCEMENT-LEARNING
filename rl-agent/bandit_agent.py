@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Epsilon-greedy bandit for path selection. Robust to 409/429 responses.
+# Now filters hosts to edge ports only using /topology/links.
 
 import argparse, time, random, sys, requests
 from collections import defaultdict
@@ -17,6 +18,7 @@ def _post(url, payload, t=8.0):
 def get_hosts(base): return _get(f"{base}/hosts") or []
 def get_ports(base): return _get(f"{base}/stats/ports") or []
 def get_paths(base, src, dst, k): return _get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}") or []
+def get_links(base): return _get(f"{base}/topology/links") or []
 
 def post_route(base, src, dst, *, path_id=None, path=None, k=2):
     payload = {'src_mac': src, 'dst_mac': dst, 'k': k}
@@ -71,12 +73,34 @@ def reward(then, now, dt):
     return (dtx / dt) - 1000.0 * ((derr + ddrop) / dt)
 
 def choose(q, n):
-    # epsilon handled outside; here pick best-known arm
     best, val = 0, -1e99
     for i in range(n):
         v = q.get(i, 0.0)
         if v > val: best, val = i, v
     return best
+
+def core_set_from_links(links):
+    s = set()
+    for L in links:
+        try:
+            s.add((int(L['src_dpid']), int(L['src_port'])))
+            s.add((int(L['dst_dpid']), int(L['dst_port'])))
+        except Exception:
+            pass
+    return s
+
+def edge_hosts_only(hosts, core):
+    out = []
+    for h in hosts:
+        try:
+            dpid = int(h['dpid']); port = int(h['port'])
+            if (dpid, port) not in core:
+                out.append(h)
+        except Exception:
+            continue
+    # sort for deterministic picking; prefer 00:00:..* if present
+    out.sort(key=lambda x: (x['mac'][:2] != '00', x['dpid'], x['port'], x['mac']))
+    return out
 
 def main():
     ap = argparse.ArgumentParser()
@@ -84,7 +108,7 @@ def main():
     ap.add_argument('--port', type=int, default=8080)
     ap.add_argument('--k', type=int, default=2)
     ap.add_argument('--epsilon', type=float, default=0.2)
-    ap.add_argument('--trials', type=int, default=600)  # long run
+    ap.add_argument('--trials', type=int, default=600)
     ap.add_argument('--measure-wait', type=float, default=3.0)
     ap.add_argument('--wait-hosts', type=int, default=60)
     ap.add_argument('--wait-paths', type=int, default=60)
@@ -92,12 +116,24 @@ def main():
 
     base = api_base(args.controller, args.port)
 
-    # Wait for 2 learned hosts
+    # Build core set from links (keep refreshing while we wait)
+    core = core_set_from_links(get_links(base))
+
+    # Wait for 2 edge hosts on different switches
     t0 = time.time()
+    src = dst = None
     while True:
-        hs = get_hosts(base)
-        if hs and len(hs) >= 2:
-            src, dst = hs[0]['mac'], hs[1]['mac']
+        core = core_set_from_links(get_links(base)) or core
+        hs = edge_hosts_only(get_hosts(base), core)
+        # pick two on different dpids if possible
+        picked = None
+        for i in range(len(hs)):
+            for j in range(i+1, len(hs)):
+                if hs[i]['dpid'] != hs[j]['dpid']:
+                    picked = (hs[i], hs[j]); break
+            if picked: break
+        if picked:
+            src, dst = picked[0]['mac'], picked[1]['mac']
             break
         if time.time() - t0 > args.wait_hosts:
             print("[agent] timeout waiting for hosts", file=sys.stderr); return 1
@@ -105,10 +141,10 @@ def main():
 
     print(f"[agent] Controller: {base} | src={src} dst={dst}")
 
-    # Wait for k>=1 paths
+    # Wait for at least one valid path (len>=2)
     t1 = time.time()
     while True:
-        ps = get_paths(base, src, dst, args.k)
+        ps = [p for p in get_paths(base, src, dst, args.k) if len(p.get('dpids', [])) >= 2]
         if ps: break
         if time.time() - t1 > args.wait_paths:
             print("[agent] timeout waiting for paths", file=sys.stderr); return 2
@@ -118,20 +154,14 @@ def main():
     prev_ports = get_ports(base); prev_idx = index_ports(prev_ports)
 
     for t in range(args.trials):
-        paths = get_paths(base, src, dst, args.k)
+        paths_raw = get_paths(base, src, dst, args.k)
+        paths = [p for p in paths_raw if len(p.get('dpids', [])) >= 2]
         if not paths:
             print("[agent] paths disappeared; skipping"); time.sleep(2.0); continue
 
         # epsilon-greedy
-        if random.random() < args.epsilon:
-            choice = random.randrange(len(paths))
-        else:
-            choice = choose(q, len(paths))
+        choice = random.randrange(len(paths)) if random.random() < args.epsilon else choose(q, len(paths))
         chosen = paths[choice]
-        if len(chosen.get('dpids', [])) < 2:
-            print('[agent] invalid path (len<2); skipping')
-            time.sleep(1.0)
-            continue
         print(f"[t={t}] choose path_id={choice} dpids={chosen.get('dpids')}")
 
         # measure before
