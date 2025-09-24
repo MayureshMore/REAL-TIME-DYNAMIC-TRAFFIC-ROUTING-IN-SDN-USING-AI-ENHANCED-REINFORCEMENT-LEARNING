@@ -92,7 +92,6 @@ class StatsController(ControllerBase):
 
     @route('health', '/api/v1/health', methods=['GET'])
     def health(self, req, **kwargs):
-        # Always return valid JSON bytes for WebOb<=1.8.x
         data = {"status": "ok", "last_stats_ts": getattr(self.app, "last_stats_ts", 0.0)}
         payload = json.dumps(data)
         return Response(content_type="application/json", body=payload.encode("utf-8"))

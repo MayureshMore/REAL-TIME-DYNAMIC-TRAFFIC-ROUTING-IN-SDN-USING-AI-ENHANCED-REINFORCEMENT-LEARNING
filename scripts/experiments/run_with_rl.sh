@@ -22,40 +22,33 @@ sudo python3 "$REPO/scripts/topos/two_path.py" \
   --controller_ip "$CTRL" --rest_port "$REST_PORT" \
   --demo --demo_time "$((DURATION-5))" --no_cli &
 
-# Wait for EDGE hosts + valid paths before agent & logger
+# Wait for links, hosts, and at least 1 candidate path before starting agent
 BASE="http://127.0.0.1:${REST_PORT}/api/v1"
 echo "Waiting up to ${WAIT_FOR_PATHS}s for hosts & paths..."
 t0=$(date +%s)
-SRC=""; DST=""
-
 while :; do
-  HOSTS="$(curl -sf "${BASE}/hosts" || echo '[]')"
-  LINKS="$(curl -sf "${BASE}/topology/links" || echo '[]')"
-
-  # Build set of core (dpid:port)
-  CORE_JSON=$(jq -c '[ .[] | "\(.src_dpid):\(.src_port)", "\(.dst_dpid):\(.dst_port)" ] | unique' <<< "${LINKS}")
-  # Filter to edge hosts only, deterministic order, prefer 00:* style
-  EDGE="$(jq -c --argjson core "${CORE_JSON}" '
-      [ .[]
-        | select(((("\(.dpid):\(.port)") as $k | ($core | index($k))) | not))
-      ]
-      | sort_by((.mac|startswith("00")|not), .dpid, .port, .mac)
-    ' <<< "${HOSTS}")"
-
-  CNT="$(jq 'length' <<< "${EDGE}")"
-  if [[ "${CNT}" -ge 2 ]]; then
-    SRC="$(jq -r '.[0].mac' <<< "${EDGE}")"
-    DST="$(jq -r '.[1].mac' <<< "${EDGE}")"
-    # Validate at least one path with dpids length >= 2
-    if curl -sf "${BASE}/paths?src_mac=${SRC}&dst_mac=${DST}&k=${K}" \
-      | jq -e '[.[] | select(.dpids|length>=2)] | length >= 1' >/dev/null; then
-      break
-    fi
+  # 1) Topology links discovered?
+  LINKS_JSON="$(curl -sf "${BASE}/topology/links" || echo '[]')"
+  if ! jq -e 'length >= 1' >/dev/null 2>&1 <<<"${LINKS_JSON}"; then
+    sleep 2
+    [[ $(( $(date +%s) - t0 )) -gt ${WAIT_FOR_PATHS} ]] && { echo "Timed out waiting for paths"; break; }
+    continue
   fi
-
-  now=$(date +%s)
-  (( now - t0 > WAIT_FOR_PATHS )) && { echo "Timed out waiting for paths"; break; }
+  # 2) Two hosts learned?
+  HOSTS_JSON="$(curl -sf "${BASE}/hosts" || echo '[]')"
+  if ! jq -e 'length >= 2' >/dev/null 2>&1 <<<"${HOSTS_JSON}"; then
+    sleep 2
+    [[ $(( $(date +%s) - t0 )) -gt ${WAIT_FOR_PATHS} ]] && { echo "Timed out waiting for paths"; break; }
+    continue
+  fi
+  SRC=$(jq -r '.[0].mac' <<<"${HOSTS_JSON}")
+  DST=$(jq -r '.[1].mac' <<<"${HOSTS_JSON}")
+  # 3) At least one multi-hop path available?
+  if curl -sf "${BASE}/paths?src_mac=${SRC}&dst_mac=${DST}&k=${K}" | jq -e 'length >= 1' >/dev/null 2>&1; then
+    break
+  fi
   sleep 2
+  [[ $(( $(date +%s) - t0 )) -gt ${WAIT_FOR_PATHS} ]] && { echo "Timed out waiting for paths"; break; }
 done
 
 echo "Starting bandit agent (epsilon=${EPSILON})"
@@ -64,7 +57,7 @@ echo "Starting bandit agent (epsilon=${EPSILON})"
   --epsilon "$EPSILON" --trials 100000 \
   --wait-hosts "$WAIT_FOR_PATHS" --wait-paths "$WAIT_FOR_PATHS" &
 
-# Start logger only after health is OK
+# Start logger for the full duration
 TS=$(date +%Y%m%d_%H%M%S)
 CSV="$REPO/docs/baseline/ports_rl_${TS}.csv"
 echo "Logging to: ${CSV}"
