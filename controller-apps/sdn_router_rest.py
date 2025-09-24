@@ -42,6 +42,7 @@ class SDNRouterREST(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.mac_to_port = defaultdict(dict)
+        self.core_ports = defaultdict(set)       # ports used for inter-switch links
         self.hosts = {}
         self.datapaths = {}
         self.G = nx.Graph()
@@ -99,6 +100,7 @@ class SDNRouterREST(app_manager.RyuApp):
         src = eth.src
         dst = eth.dst
 
+        # Learn hosts only on non-core (edge) ports
         if in_port not in self.core_ports.get(dpid, set()):
             self.mac_to_port[dpid][src] = in_port
             self.hosts[src] = {'dpid': dpid, 'port': in_port}
@@ -119,6 +121,19 @@ class SDNRouterREST(app_manager.RyuApp):
         u_p, v_p = l.src.port_no, l.dst.port_no
         self.G.add_edge(u, v, u_port=u_p, v_port=v_p)
         self.G.add_edge(v, u, u_port=v_p, v_port=u_p)
+        self.core_ports[u].add(u_p)
+        self.core_ports[v].add(v_p)
+        self.k_paths_cached.clear()
+
+    @set_ev_cls(topo_event.EventLinkDelete)
+    def link_del_handler(self, ev):
+        l = ev.link
+        u, v = l.src.dpid, l.dst.dpid
+        u_p, v_p = l.src.port_no, l.dst.port_no
+        if self.G.has_edge(u, v): self.G.remove_edge(u, v)
+        if self.G.has_edge(v, u): self.G.remove_edge(v, u)
+        self.core_ports[u].discard(u_p)
+        self.core_ports[v].discard(v_p)
         self.k_paths_cached.clear()
 
     def _monitor(self):
@@ -365,6 +380,6 @@ class RESTController(ControllerBase):
         try:
             with open('docs/openapi.yaml', 'rb') as f:
                 spec = f.read()
-            return Response(content_type='application/yaml', body=((spec).encode('utf-8')).encode('utf-8'))
+            return Response(content_type='application/yaml', body=spec)
         except Exception as e:
             return j({'error': 'openapi_not_found', 'detail': str(e)}, status=500)

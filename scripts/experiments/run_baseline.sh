@@ -13,19 +13,6 @@ LOG="$HOME/ryu-controller.log"
 TMUX_SOCKET="-L ryu"
 SESSION="ryu_run"
 
-# --- Small self-heal: ensure health() returns bytes in WebOb<=1.8 ---
-PATCH_APP="$REPO/controller-apps/sdn_router_rest.py"
-"$PY_BIN" - "$PATCH_APP" <<'PY'
-import io, re, sys, json
-p=sys.argv[1]; s=io.open(p,'r',encoding='utf-8').read()
-def fix(txt, name):
-    pat=re.compile(rf'(@route\([^\n]+\)\s*def\s+{name}\([^\)]*\):\s*\n)(\s*)return Response\([^\n]*body\s*=\s*json\.dumps\([^\)]*\)\s*\)', re.S)
-    return pat.sub(r"\1\2import json\n\2return Response(content_type='application/json', body=json.dumps({}) if False else json.dumps({}).encode('utf-8'))".format({},{}), txt)
-s=fix(s,'health'); s=fix(s,'stats_ports'); s=fix(s,'stats_flows'); s=fix(s,'topo_nodes'); s=fix(s,'topo_links'); s=fix(s,'hosts'); s=fix(s,'paths'); s=fix(s,'route_action'); s=fix(s,'route_list'); s=fix(s,'route_delete'); s=fix(s,'link_metrics')
-io.open(p,'w',encoding='utf-8').write(s)
-print("Patched:", p)
-PY
-
 # --- Start/Restart controller in tmux ---
 tmux ${TMUX_SOCKET} kill-session -t "${SESSION}" 2>/dev/null || true
 echo "Starting controller on OF:${OF_PORT} REST:${REST_PORT}"
