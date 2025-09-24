@@ -16,6 +16,7 @@ echo "Starting controller on OF:${OF_PORT} REST:${WSAPI_PORT}"
 tmux ${TMUX_SOCKET} new -d -s "${SESSION}" \
   "cd '${REPO}' && exec '${RYU_BIN}' \
      '${REPO}/controller-apps/sdn_router_rest.py' ryu.topology.switches \
+     --observe-links \
      --ofp-tcp-listen-port ${OF_PORT} --wsapi-port ${WSAPI_PORT} >>'${LOG}' 2>&1"
 
 # Wait for REST health

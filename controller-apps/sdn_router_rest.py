@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # Ryu app: L2 learning + topology discovery + k-shortest paths + REST + actions
-# Key fixes in this version:
-# - Learn hosts on any non-core port even before topology is known (break bootstrapping deadlock)
-# - When a port later becomes core (via LLDP link discovery), purge any host learned there
-# - Directed topology (DiGraph) so each edge carries correct per-direction port metadata
-# - Only return multi-switch paths (len(dpids) >= 2)
-# - Robust JSON responses and OpenAPI handler
+# Fixes:
+# - Learn on non-core ports; sweep/purge any host learned on core ports once links appear
+# - Directed topology with correct per-direction ports; only return multi-switch paths
+# - /hosts now filters to edge hosts (non-core ports) to avoid junk entries
+# - Robust health/OpenAPI bytes responses
 
 from collections import defaultdict
 import hashlib, json, time
@@ -47,20 +46,13 @@ class SDNRouterREST(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # L2 learning & host table
-        self.mac_to_port = defaultdict(dict)        # dpid -> {mac: port}
-        self.hosts = {}                              # mac -> {dpid, port}
-
-        # Switches and links (directed graph)
+        self.mac_to_port = defaultdict(dict)         # dpid -> {mac: port}
+        self.hosts = {}                               # mac -> {dpid, port}
         self.datapaths = {}
         self.G = nx.DiGraph()
-
-        # Inter-switch (core) ports per switch
-        self.core_ports = defaultdict(set)           # dpid -> {port_no}
-
-        # Path/service state
+        self.core_ports = defaultdict(set)            # dpid -> {port_no}
         self.k_paths_cached = {}
-        self.routes = {}                             # (src,dst) -> {cookie, path}
+        self.routes = {}                              # (src,dst) -> {cookie, path}
         self.last_action_ts = {}
         self.route_cooldown = 5.0
 
@@ -71,7 +63,7 @@ class SDNRouterREST(app_manager.RyuApp):
         self.flow_stats = []
         self.last_stats_ts = 0.0
 
-        # Background workers
+        # Background
         self.monitor_interval = 2
         self.monitor_thread = hub.spawn(self._monitor)
         self.sweep_thread = hub.spawn(self._sweep_core_leaks)
@@ -87,7 +79,6 @@ class SDNRouterREST(app_manager.RyuApp):
         dp = ev.msg.datapath
         ofp = dp.ofproto
         parser = dp.ofproto_parser
-        # Table-miss to controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -110,15 +101,13 @@ class SDNRouterREST(app_manager.RyuApp):
                 self.k_paths_cached = {k:v for k,v in self.k_paths_cached.items()
                                        if dp.id not in (k[0], k[1])}
 
-    # --- L2 learning with core-port awareness ---
+    # --- L2 learning + core-port hygiene ---
 
     def _purge_hosts_on_port(self, dpid, port_no):
-        # Remove any host learned on (dpid, port_no) and clear mac_to_port entries
         to_delete = [m for m, meta in self.hosts.items()
                      if meta.get('dpid') == dpid and meta.get('port') == port_no]
         for mac in to_delete:
             self.hosts.pop(mac, None)
-        # Also purge L2 table entries pointing to this port
         bad_mac = [m for m, p in self.mac_to_port.get(dpid, {}).items() if p == port_no]
         for mac in bad_mac:
             self.mac_to_port[dpid].pop(mac, None)
@@ -141,7 +130,6 @@ class SDNRouterREST(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
-        # Ignore LLDP frames used by topology discovery
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
@@ -149,16 +137,14 @@ class SDNRouterREST(app_manager.RyuApp):
         src = eth.src
         dst = eth.dst
 
-        # FIX: learn on any non-core port (even if we don't yet know core ports on this switch)
+        # Learn only on non-core ports (core-port set may be empty before discovery, that's ok)
         if in_port not in self.core_ports.get(dpid, set()):
             self.mac_to_port[dpid][src] = in_port
             self.hosts[src] = {'dpid': dpid, 'port': in_port}
 
-        # L2 forwarding (flood if unknown)
         out_port = self.mac_to_port[dpid].get(dst, ofp.OFPP_FLOOD)
         actions = [parser.OFPActionOutput(out_port)]
 
-        # Install a unicast flow when we know the dst on this switch
         if out_port != ofp.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_dst=dst)
             inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -175,17 +161,16 @@ class SDNRouterREST(app_manager.RyuApp):
         u, v = l.src.dpid, l.dst.dpid
         u_p, v_p = l.src.port_no, l.dst.port_no
 
-        # Directed edges with per-direction egress port
         self.G.add_edge(u, v, u_port=u_p, v_port=v_p)
         self.G.add_edge(v, u, u_port=v_p, v_port=u_p)
 
-        # Mark inter-switch ports as core on both ends and purge any hosts there
         self._mark_core_port(u, u_p, True)
         self._mark_core_port(v, v_p, True)
         self._purge_hosts_on_port(u, u_p)
         self._purge_hosts_on_port(v, v_p)
 
         self.k_paths_cached.clear()
+        self.logger.info("Link added: %s:%s <-> %s:%s", u, u_p, v, v_p)
 
     @set_ev_cls(topo_event.EventLinkDelete)
     def link_del_handler(self, ev):
@@ -197,8 +182,8 @@ class SDNRouterREST(app_manager.RyuApp):
         self._mark_core_port(u, u_p, False)
         self._mark_core_port(v, v_p, False)
         self.k_paths_cached.clear()
+        self.logger.info("Link deleted: %s:%s <-> %s:%s", u, u_p, v, v_p)
 
-    # Continuous sweeper to catch races during discovery
     def _sweep_core_leaks(self):
         while True:
             try:
@@ -371,7 +356,13 @@ class RESTController(ControllerBase):
 
     @route('hosts', '/api/v1/hosts', methods=['GET'])
     def hosts(self, req, **kwargs):
-        items = [{'mac': m, 'dpid': inf['dpid'], 'port': inf['port']} for m, inf in self.app.hosts.items()]
+        items = []
+        for m, inf in self.app.hosts.items():
+            dpid, port = inf['dpid'], inf['port']
+            # Expose only edge-hosts (non-core ports)
+            if port in self.app.core_ports.get(dpid, set()):
+                continue
+            items.append({'mac': m, 'dpid': dpid, 'port': port})
         return j(items)
 
     @route('paths', '/api/v1/paths', methods=['GET'])

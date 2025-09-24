@@ -22,33 +22,31 @@ sudo python3 "$REPO/scripts/topos/two_path.py" \
   --controller_ip "$CTRL" --rest_port "$REST_PORT" \
   --demo --demo_time "$((DURATION-5))" --no_cli &
 
-# Wait for links, hosts, and at least 1 candidate path before starting agent
+# Wait for any valid host pair with at least one path
 BASE="http://127.0.0.1:${REST_PORT}/api/v1"
 echo "Waiting up to ${WAIT_FOR_PATHS}s for hosts & paths..."
 t0=$(date +%s)
+SRC=""; DST=""
 while :; do
-  # 1) Topology links discovered?
-  LINKS_JSON="$(curl -sf "${BASE}/topology/links" || echo '[]')"
-  if ! jq -e 'length >= 1' >/dev/null 2>&1 <<<"${LINKS_JSON}"; then
-    sleep 2
-    [[ $(( $(date +%s) - t0 )) -gt ${WAIT_FOR_PATHS} ]] && { echo "Timed out waiting for paths"; break; }
-    continue
+  HS_JSON="$(curl -sf "${BASE}/hosts" || echo '[]')"
+  COUNT="$(printf '%s' "$HS_JSON" | jq -r 'length')"
+  if [[ "$COUNT" -ge 2 ]]; then
+    # try all pairs until one yields a non-empty /paths
+    i=0
+    while [[ $i -lt $COUNT ]]; do
+      j=$((i+1))
+      while [[ $j -lt $COUNT ]]; do
+        SRC_CAND="$(printf '%s' "$HS_JSON" | jq -r ".[$i].mac")"
+        DST_CAND="$(printf '%s' "$HS_JSON" | jq -r ".[$j].mac")"
+        PATHS_OK=$(curl -sf "${BASE}/paths?src_mac=${SRC_CAND}&dst_mac=${DST_CAND}&k=${K}" | jq -e 'length >= 1' >/dev/null 2>&1 && echo yes || echo no)
+        if [[ "$PATHS_OK" == "yes" ]]; then SRC="$SRC_CAND"; DST="$DST_CAND"; break 2; fi
+        j=$((j+1))
+      done
+      i=$((i+1))
+    done
   fi
-  # 2) Two hosts learned?
-  HOSTS_JSON="$(curl -sf "${BASE}/hosts" || echo '[]')"
-  if ! jq -e 'length >= 2' >/dev/null 2>&1 <<<"${HOSTS_JSON}"; then
-    sleep 2
-    [[ $(( $(date +%s) - t0 )) -gt ${WAIT_FOR_PATHS} ]] && { echo "Timed out waiting for paths"; break; }
-    continue
-  fi
-  SRC=$(jq -r '.[0].mac' <<<"${HOSTS_JSON}")
-  DST=$(jq -r '.[1].mac' <<<"${HOSTS_JSON}")
-  # 3) At least one multi-hop path available?
-  if curl -sf "${BASE}/paths?src_mac=${SRC}&dst_mac=${DST}&k=${K}" | jq -e 'length >= 1' >/dev/null 2>&1; then
-    break
-  fi
+  now=$(date +%s); (( now - t0 > WAIT_FOR_PATHS )) && { echo "Timed out waiting for paths"; break; }
   sleep 2
-  [[ $(( $(date +%s) - t0 )) -gt ${WAIT_FOR_PATHS} ]] && { echo "Timed out waiting for paths"; break; }
 done
 
 echo "Starting bandit agent (epsilon=${EPSILON})"
@@ -57,7 +55,6 @@ echo "Starting bandit agent (epsilon=${EPSILON})"
   --epsilon "$EPSILON" --trials 100000 \
   --wait-hosts "$WAIT_FOR_PATHS" --wait-paths "$WAIT_FOR_PATHS" &
 
-# Start logger for the full duration
 TS=$(date +%Y%m%d_%H%M%S)
 CSV="$REPO/docs/baseline/ports_rl_${TS}.csv"
 echo "Logging to: ${CSV}"

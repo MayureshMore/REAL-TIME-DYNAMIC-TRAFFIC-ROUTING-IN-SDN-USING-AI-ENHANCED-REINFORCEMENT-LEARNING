@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Epsilon-greedy bandit for path selection. Robust to 409/429 responses.
-# Now filters hosts to edge ports only using /topology/links.
+# Fix: pick a valid (src,dst) by probing /paths over all host pairs.
 
 import argparse, time, random, sys, requests
 from collections import defaultdict
@@ -18,7 +18,6 @@ def _post(url, payload, t=8.0):
 def get_hosts(base): return _get(f"{base}/hosts") or []
 def get_ports(base): return _get(f"{base}/stats/ports") or []
 def get_paths(base, src, dst, k): return _get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}") or []
-def get_links(base): return _get(f"{base}/topology/links") or []
 
 def post_route(base, src, dst, *, path_id=None, path=None, k=2):
     payload = {'src_mac': src, 'dst_mac': dst, 'k': k}
@@ -32,7 +31,6 @@ def safe_post_route(base, src, dst, **kw):
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else None
         if code == 429:
-            # cooldown active
             retry_after = 3
             try: retry_after = int(e.response.json().get('retry_after', 3))
             except Exception: pass
@@ -40,7 +38,6 @@ def safe_post_route(base, src, dst, **kw):
             time.sleep(max(1, retry_after))
             return None
         if code == 409:
-            # e.g. no_path or race — just skip this tick
             try: print(f"[agent] 409: {e.response.json()}")
             except Exception: print("[agent] 409 Conflict")
             return None
@@ -79,28 +76,24 @@ def choose(q, n):
         if v > val: best, val = i, v
     return best
 
-def core_set_from_links(links):
-    s = set()
-    for L in links:
-        try:
-            s.add((int(L['src_dpid']), int(L['src_port'])))
-            s.add((int(L['dst_dpid']), int(L['dst_port'])))
-        except Exception:
-            pass
-    return s
-
-def edge_hosts_only(hosts, core):
-    out = []
-    for h in hosts:
-        try:
-            dpid = int(h['dpid']); port = int(h['port'])
-            if (dpid, port) not in core:
-                out.append(h)
-        except Exception:
-            continue
-    # sort for deterministic picking; prefer 00:00:..* if present
-    out.sort(key=lambda x: (x['mac'][:2] != '00', x['dpid'], x['port'], x['mac']))
-    return out
+def pick_valid_pair(base, k, wait_sec):
+    """Pick (src,dst) such that /paths returns at least one path."""
+    t0 = time.time()
+    while True:
+        hs = get_hosts(base)
+        if hs and len(hs) >= 2:
+            for i in range(len(hs)):
+                for j in range(i+1, len(hs)):
+                    s = hs[i]['mac']; d = hs[j]['mac']
+                    try:
+                        ps = get_paths(base, s, d, k)
+                        if ps:
+                            return s, d
+                    except Exception:
+                        pass
+        if time.time() - t0 > wait_sec:
+            return None, None
+        time.sleep(1.5)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -116,72 +109,46 @@ def main():
 
     base = api_base(args.controller, args.port)
 
-    # Build core set from links (keep refreshing while we wait)
-    core = core_set_from_links(get_links(base))
-
-    # Wait for 2 edge hosts on different switches
-    t0 = time.time()
-    src = dst = None
-    while True:
-        core = core_set_from_links(get_links(base)) or core
-        hs = edge_hosts_only(get_hosts(base), core)
-        # pick two on different dpids if possible
-        picked = None
-        for i in range(len(hs)):
-            for j in range(i+1, len(hs)):
-                if hs[i]['dpid'] != hs[j]['dpid']:
-                    picked = (hs[i], hs[j]); break
-            if picked: break
-        if picked:
-            src, dst = picked[0]['mac'], picked[1]['mac']
-            break
-        if time.time() - t0 > args.wait_hosts:
-            print("[agent] timeout waiting for hosts", file=sys.stderr); return 1
-        time.sleep(1.5)
-
+    # Pick a valid pair by probing /paths
+    src, dst = pick_valid_pair(base, args.k, max(args.wait_hosts, args.wait_paths))
+    if not src or not dst:
+        print("[agent] timeout waiting for paths", file=sys.stderr); return 2
     print(f"[agent] Controller: {base} | src={src} dst={dst}")
-
-    # Wait for at least one valid path (len>=2)
-    t1 = time.time()
-    while True:
-        ps = [p for p in get_paths(base, src, dst, args.k) if len(p.get('dpids', [])) >= 2]
-        if ps: break
-        if time.time() - t1 > args.wait_paths:
-            print("[agent] timeout waiting for paths", file=sys.stderr); return 2
-        print("[agent] No paths yet; retrying..."); time.sleep(2.0)
 
     q = {}; plays = {}
     prev_ports = get_ports(base); prev_idx = index_ports(prev_ports)
 
     for t in range(args.trials):
-        paths_raw = get_paths(base, src, dst, args.k)
-        paths = [p for p in paths_raw if len(p.get('dpids', [])) >= 2]
+        paths = get_paths(base, src, dst, args.k)
         if not paths:
             print("[agent] paths disappeared; skipping"); time.sleep(2.0); continue
 
         # epsilon-greedy
-        choice = random.randrange(len(paths)) if random.random() < args.epsilon else choose(q, len(paths))
+        if random.random() < args.epsilon:
+            choice = random.randrange(len(paths))
+        else:
+            choice = choose(q, len(paths))
         chosen = paths[choice]
+        if len(chosen.get('dpids', [])) < 2:
+            print('[agent] invalid path (len<2); skipping')
+            time.sleep(1.0)
+            continue
         print(f"[t={t}] choose path_id={choice} dpids={chosen.get('dpids')}")
 
-        # measure before
         ports_then = get_ports(base); idx_then = index_ports(ports_then)
         agg_then = aggregate(chosen.get('hops', []), idx_then); t_then = time.time()
 
-        # try to apply route (ignore 409/429)
         safe_post_route(base, src, dst, path_id=choice, k=args.k)
 
-        # measure after
         time.sleep(max(0.5, args.measure_wait))
         ports_now = get_ports(base); idx_now = index_ports(ports_now)
         agg_now = aggregate(chosen.get('hops', []), idx_now); t_now = time.time()
 
         r = reward(agg_then, agg_now, t_now - t_then)
         plays[choice] = plays.get(choice, 0) + 1
-        q[choice] = q.get(choice, 0.0) + (r - q.get(choice, 0.0)) / plays[choice]
+        q[choice] = q.get(choice, 0.0) + (r - q[choice]) / plays[choice] if choice in q else r
         print(f"  reward≈{r:.2f} | plays={plays[choice]} | q[{choice}]≈{q[choice]:.2f}", flush=True)
 
-        prev_idx = idx_now
     print("[agent] Done. Q-estimates:", {k: round(v, 2) for k, v in q.items()})
     return 0
 
