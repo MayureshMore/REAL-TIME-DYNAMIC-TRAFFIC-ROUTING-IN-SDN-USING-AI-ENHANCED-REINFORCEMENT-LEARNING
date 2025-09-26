@@ -1,5 +1,7 @@
 # 🚦 Real-Time Dynamic Traffic Routing in SDN using AI-Enhanced Reinforcement Learning
 
+![Prototype running on Raspberry Pi](PROTOTYPE.JPG)
+
 Ryu-based OpenFlow13 controller with:
 - Topology discovery + k-shortest paths
 - REST API for stats, paths, and actions
