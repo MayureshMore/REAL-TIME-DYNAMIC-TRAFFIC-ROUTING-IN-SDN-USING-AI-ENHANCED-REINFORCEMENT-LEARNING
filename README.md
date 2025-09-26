@@ -14,7 +14,7 @@ Ryu-based OpenFlow13 controller with:
 
 ## 👨‍💻 Contributors & Scope-of-Work 
 
-### **Mayuresh Sanjay More – RL Agent, Experimentation & Project Integration (Lead)**
+### **Mayuresh Sanjay More – RL Agent, Experimentation & Project Integration**
 - ✅ Designed and implemented **core reinforcement learning modules**
     - `rl-agent/bandit_agent.py` (ε-greedy with cooldown handling)
     - `rl-agent/linucb_agent.py` (contextual bandit with path-level features)
@@ -27,7 +27,7 @@ Ryu-based OpenFlow13 controller with:
 
 ---
 
-### **Zeel Pankaj Patel – SDN Topology, Automation & Infrastructure (Lead)**
+### **Zeel Pankaj Patel – SDN Topology, Automation & Infrastructure**
 - ✅ Built and validated **Mininet topologies** (`scripts/topos/two_path.py`) with multiple disjoint paths
 - ✅ Authored **controller bring-up & orchestration scripts** (`scripts/run_ryu.sh`, `scripts/_ensure_controller.sh`)
 - ✅ Developed **baseline and RL experiment wrappers** with integrated health monitoring
@@ -80,20 +80,13 @@ Logs and CSV results are stored under:
 ```
 docs/baseline/
 ```
+![Snapshot of Code](Snapshot.png)
 
 ---
 
-## 📊 Results & Visualizations
-
 ### Key Observations
 - **Baseline:** Higher packet drop, lower throughput.  
-- **RL Agent:** Learns optimal multi-path routing, reduces packet drops, improves aggregate throughput.  
-
-### Suggested Visualizations
-- Throughput vs Time (line chart)  
-- Packet Drops vs Time (line chart)  
-- ECDF of Throughput (cumulative distribution)  
-- Mean TX & Drops (bar chart)  
+- **RL Agent:** Learns optimal multi-path routing, reduces packet drops, improves aggregate throughput.
 
 ---
 
@@ -114,4 +107,4 @@ docs/baseline/
 ---
 
 ## ⭐ Acknowledgements
-Special thanks to our professors and peers at **University of the Pacific** for guidance.
+Special thanks to  professor Solomon Berhe and peers at **University of the Pacific** for guidance.
