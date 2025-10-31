@@ -1,22 +1,45 @@
 #!/usr/bin/env python3
-# LinUCB contextual bandit for path selection with simple anomaly-aware filtering.
+# LinUCB Contextual Bandit Agent for SDN Path Selection
+# -----------------------------------------------------
+# Improvements:
+# - Ridge regularization (λI) for numerical stability
+# - Anomaly filtering based on drop/error rate
+# - Normalized feature vectors
+# - Uses NumPy for clean math
+# - Compatible with Bandit and DQN agents
 
-import argparse, time, math, random, requests
+import argparse, time, random, math, requests, sys
+import numpy as np
 from collections import defaultdict
 
 def api_base(host, port): return f"http://{host}:{port}/api/v1"
 
-def get_hosts(base):
-    r=requests.get(f"{base}/hosts",timeout=5); r.raise_for_status(); return r.json()
-def get_ports(base):
-    r=requests.get(f"{base}/stats/ports",timeout=5); r.raise_for_status(); return r.json()
-def get_paths(base, src, dst, k):
-    r=requests.get(f"{base}/paths", params={'src_mac':src,'dst_mac':dst,'k':k}, timeout=8); r.raise_for_status(); return r.json()
+def safe_get(url, timeout=6):
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("[linucb] GET failed:", e)
+        return None
+
+def safe_post(url, payload, timeout=8):
+    try:
+        r = requests.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("[linucb] POST failed:", e)
+        return None
+
+def get_hosts(base): return safe_get(f"{base}/hosts") or []
+def get_ports(base): return safe_get(f"{base}/stats/ports") or []
+def get_paths(base, src, dst, k): return safe_get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}") or []
 def post_route(base, src, dst, path_id=None, path=None, k=2):
     payload={'src_mac':src,'dst_mac':dst,'k':k}
     if path_id is not None: payload['path_id']=int(path_id)
     if path is not None: payload['path']=list(path)
-    r=requests.post(f"{base}/actions/route", json=payload, timeout=8); r.raise_for_status(); return r.json()
+    return safe_post(f"{base}/actions/route", payload)
 
 def index_ports(snapshot):
     idx=defaultdict(dict)
@@ -26,103 +49,146 @@ def index_ports(snapshot):
     return idx
 
 def path_features(hops, prev_idx, cur_idx, dt):
-    if dt<=0: dt=1e-6
-    tx0=rx0=e0=d0=0.0; tx1=rx1=e1=d1=0.0
+    """Return normalized features and anomaly score"""
+    if dt <= 0: dt = 1e-6
+    tx0 = rx0 = e0 = d0 = 0.0
+    tx1 = rx1 = e1 = d1 = 0.0
     for h in hops:
-        dpid=int(h['dpid']); outp=int(h['out_port'])
-        p0=prev_idx.get(dpid,{}).get(outp); p1=cur_idx.get(dpid,{}).get(outp)
-        if not p0 or not p1: continue
-        tx0+=p0.get('tx_bytes',0); tx1+=p1.get('tx_bytes',0)
-        rx0+=p0.get('rx_bytes',0); rx1+=p1.get('rx_bytes',0)
-        e0+=p0.get('rx_errors',0)+p0.get('tx_errors',0)
-        e1+=p1.get('rx_errors',0)+p1.get('tx_errors',0)
-        d0+=p0.get('rx_dropped',0)+p0.get('tx_dropped',0)
-        d1+=p1.get('rx_dropped',0)+p1.get('tx_dropped',0)
-    tx_bps=max(0.0,(tx1-tx0)*8.0/dt); rx_bps=max(0.0,(rx1-rx0)*8.0/dt)
-    err_rate=max(0.0,(e1-e0)/dt); drop_rate=max(0.0,(d1-d0)/dt)
-    x=[tx_bps, rx_bps, err_rate, drop_rate, float(len(hops)), 1.0]
-    anomaly=err_rate+drop_rate
+        dpid = int(h.get("dpid", -1))
+        outp = int(h.get("out_port", -1))
+        p0 = prev_idx.get(dpid, {}).get(outp)
+        p1 = cur_idx.get(dpid, {}).get(outp)
+        if not p0 or not p1:
+            continue
+        tx0 += p0.get("tx_bytes", 0); tx1 += p1.get("tx_bytes", 0)
+        rx0 += p0.get("rx_bytes", 0); rx1 += p1.get("rx_bytes", 0)
+        e0 += p0.get("rx_errors", 0) + p0.get("tx_errors", 0)
+        e1 += p1.get("rx_errors", 0) + p1.get("tx_errors", 0)
+        d0 += p0.get("rx_dropped", 0) + p0.get("tx_dropped", 0)
+        d1 += p1.get("rx_dropped", 0) + p1.get("tx_dropped", 0)
+
+    tx_bps = max(0.0, (tx1 - tx0) * 8.0 / dt)
+    rx_bps = max(0.0, (rx1 - rx0) * 8.0 / dt)
+    err_rate = max(0.0, (e1 - e0) / dt)
+    drop_rate = max(0.0, (d1 - d0) / dt)
+
+    # normalize values to avoid dominance
+    scale = 1e7
+    x = np.array([
+        tx_bps / scale,
+        rx_bps / scale,
+        err_rate / 100.0,
+        drop_rate / 100.0,
+        len(hops) / 10.0,
+        1.0
+    ])
+    anomaly = err_rate + drop_rate
     return x, anomaly
 
-class LinUCB:
-    def __init__(self,d,alpha=1.0):
-        self.d=d; self.alpha=alpha
-        self.A=defaultdict(lambda:[[1.0 if i==j else 0.0 for j in range(d)] for i in range(d)])
-        self.b=defaultdict(lambda:[0.0]*d)
-    def Ainv(self,A):
-        n=self.d
-        aug=[row[:] + [1.0 if i==j else 0.0 for j in range(n)] for i,row in enumerate(A)]
-        for i in range(n):
-            piv=aug[i][i] or 1e-6
-            aug[i]=[v/piv for v in aug[i]]
-            for k in range(n):
-                if k==i: continue
-                fac=aug[k][i]
-                aug[k]=[aug[k][j]-fac*aug[i][j] for j in range(2*n)]
-        return [row[n:] for row in aug]
-    def mv(self,M,v): return [sum(M[i][j]*v[j] for j in range(self.d)) for i in range(self.d)]
-    def quad(self,v,M): t=self.mv(M,v); return sum(v[i]*t[i] for i in range(self.d))
-    def predict_ucb(self,i,x):
-        A=self.A[i]; b=self.b[i]; Ai=self.Ainv(A)
-        theta=self.mv(Ai,b); mu=sum(theta[j]*x[j] for j in range(self.d))
-        bonus=self.alpha*math.sqrt(max(1e-12,self.quad(x,Ai)))
-        return mu+bonus
-    def update(self,i,x,r):
-        A=self.A[i]; b=self.b[i]
-        for p in range(self.d):
-            for q in range(self.d): A[p][q]+=x[p]*x[q]
-        for p in range(self.d): b[p]+=r*x[p]
-        self.A[i]=A; self.b[i]=b
-
 def reward_from_deltas(prev_idx, cur_idx, hops, dt):
-    x,anom=path_features(hops, prev_idx, cur_idx, dt)
-    return x[0] - 8000.0*anom
+    """Reward = throughput - error penalty (normalized)"""
+    if dt <= 0: dt = 1e-6
+    tx_bps = 0.0
+    drop = err = 0.0
+    for h in hops:
+        dpid = int(h["dpid"]); outp = int(h["out_port"])
+        p0 = prev_idx.get(dpid, {}).get(outp)
+        p1 = cur_idx.get(dpid, {}).get(outp)
+        if not p0 or not p1: continue
+        tx_bps += (p1.get("tx_bytes", 0) - p0.get("tx_bytes", 0)) * 8.0 / dt
+        drop += (p1.get("tx_dropped", 0) + p1.get("rx_dropped", 0)) - (p0.get("tx_dropped", 0) + p0.get("rx_dropped", 0))
+        err  += (p1.get("tx_errors", 0) + p1.get("rx_errors", 0)) - (p0.get("tx_errors", 0) + p0.get("rx_errors", 0))
+    MAX_BW = 10_000_000.0
+    r = (tx_bps / MAX_BW) - 0.0001 * (drop + err)
+    return float(np.clip(r, -1.0, 1.0))
+
+class LinUCB:
+    def __init__(self, d, alpha=1.0, lam=1.0):
+        self.d = d
+        self.alpha = alpha
+        self.lam = lam
+        self.A = defaultdict(lambda: np.eye(d) * lam)
+        self.b = defaultdict(lambda: np.zeros((d, 1)))
+
+    def predict_ucb(self, arm, x):
+        A = self.A[arm]; b = self.b[arm]
+        A_inv = np.linalg.inv(A)
+        theta = A_inv @ b
+        mu = float(np.dot(x, theta))
+        bonus = self.alpha * math.sqrt(max(1e-12, np.dot(x, A_inv @ x)))
+        return mu + bonus
+
+    def update(self, arm, x, r):
+        x = x.reshape(-1, 1)
+        self.A[arm] += x @ x.T
+        self.b[arm] += r * x
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('--controller',default='127.0.0.1'); ap.add_argument('--port',type=int,default=8080)
-    ap.add_argument('--k',type=int,default=2); ap.add_argument('--epsilon',type=float,default=0.1)
-    ap.add_argument('--alpha',type=float,default=1.0); ap.add_argument('--trials',type=int,default=10)
-    ap.add_argument('--err_thresh',type=float,default=5.0)
-    args=ap.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--controller", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--k", type=int, default=2)
+    ap.add_argument("--alpha", type=float, default=1.0)
+    ap.add_argument("--lambda_", type=float, default=1.0)
+    ap.add_argument("--epsilon", type=float, default=0.1)
+    ap.add_argument("--trials", type=int, default=100)
+    ap.add_argument("--err_thresh", type=float, default=5.0)
+    args = ap.parse_args()
 
-    base=api_base(args.controller,args.port)
-    hosts=get_hosts(base)
-    if len(hosts)<2: raise SystemExit('Need at least 2 hosts learned (run pingall)')
-    src,dst=hosts[0]['mac'],hosts[1]['mac']
+    base = api_base(args.controller, args.port)
+    hosts = get_hosts(base)
+    if len(hosts) < 2:
+        print("[linucb] Not enough hosts learned.")
+        sys.exit(1)
+    src, dst = hosts[0]["mac"], hosts[1]["mac"]
+    lin = LinUCB(d=6, alpha=args.alpha, lam=args.lambda_)
 
-    lin=LinUCB(d=6,alpha=args.alpha)
-    prev_ports=get_ports(base); prev_idx=index_ports(prev_ports); prev_t=time.time()
+    prev_ports = get_ports(base)
+    prev_idx = index_ports(prev_ports)
+    prev_t = time.time()
 
     for t in range(args.trials):
-        time.sleep(2.0)
-        cur_ports=get_ports(base); cur_idx=index_ports(cur_ports); now=time.time(); dt=now-prev_t
+        time.sleep(2)
+        cur_ports = get_ports(base)
+        cur_idx = index_ports(cur_ports)
+        now = time.time()
+        dt = now - prev_t
+        paths = get_paths(base, src, dst, args.k)
+        if not paths:
+            print("[linucb] No paths available; retrying...")
+            prev_t = now
+            continue
 
-        paths=get_paths(base,src,dst,args.k)
-        if not paths: print('No paths; retrying...'); prev_t=now; continue
-
-        arms=[]
-        for i,p in enumerate(paths):
-            x,anom=path_features(p.get('hops',[]), prev_idx, cur_idx, dt)
-            if anom<=args.err_thresh: arms.append((i,x,p))
+        arms = []
+        for i, p in enumerate(paths):
+            x, anomaly = path_features(p.get("hops", []), prev_idx, cur_idx, dt)
+            if anomaly <= args.err_thresh:
+                arms.append((i, x, p))
         if not arms:
-            arms=[(i, path_features(p.get('hops',[]), prev_idx, cur_idx, dt)[0], p) for i,p in enumerate(paths)]
+            arms = [(i, path_features(p.get("hops", []), prev_idx, cur_idx, dt)[0], p) for i, p in enumerate(paths)]
 
-        if random.random()<args.epsilon: j=random.randrange(len(arms))
+        # epsilon exploration
+        if random.random() < args.epsilon:
+            j = random.randrange(len(arms))
         else:
-            scores=[lin.predict_ucb(i,x) for (i,x,_) in arms]
-            j=max(range(len(arms)), key=lambda k:scores[k])
-        pid,x,chosen=arms[j]
+            scores = [lin.predict_ucb(i, x) for (i, x, _) in arms]
+            j = int(np.argmax(scores))
+        pid, x, chosen = arms[j]
+
         print(f"[t={t}] choose path_id={pid} dpids={chosen.get('dpids')}")
-        try: post_route(base,src,dst,path_id=pid,k=args.k)
-        except Exception as e: print("post_route failed:", e)
+        post_route(base, src, dst, path_id=pid, k=args.k)
 
-        time.sleep(3.0)
-        new_ports=get_ports(base); new_idx=index_ports(new_ports)
-        r=reward_from_deltas(prev_idx,new_idx,chosen.get('hops',[]),dt=3.0)
-        lin.update(pid,x,r); print(f"  reward≈{r:.2f}")
+        time.sleep(3)
+        new_ports = get_ports(base)
+        new_idx = index_ports(new_ports)
+        r = reward_from_deltas(prev_idx, new_idx, chosen.get("hops", []), 3.0)
+        lin.update(pid, x, r)
+        print(f"  reward={r:.3f}")
+        prev_idx = new_idx
+        prev_t = time.time()
 
-        prev_idx=new_idx; prev_t=time.time()
-    print("LinUCB finished.")
+    print("[linucb] finished.")
+    return 0
 
-if __name__=='__main__': main()
+if __name__ == "__main__":
+    sys.exit(main())
