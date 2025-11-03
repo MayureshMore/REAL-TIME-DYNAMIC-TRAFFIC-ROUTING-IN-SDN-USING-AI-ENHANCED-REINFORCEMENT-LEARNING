@@ -321,7 +321,66 @@ class RESTController(ControllerBase):
 
     @route('stats_ports','/api/v1/stats/ports',methods=['GET'])
     def stats_ports(self,req,**kw): return j(self.app.port_stats)
+
     @route('stats_flows','/api/v1/stats/flows',methods=['GET'])
     def stats_flows(self,req,**kw): return j(self.app.flow_stats)
+
     @route('metrics_links','/api/v1/metrics/links',methods=['GET'])
     def metrics_links(self,req,**kw): return j(self.app._links_with_tx_bps())
+
+    # -------- Added to match OpenAPI/docs --------
+
+    @route('topo_nodes', '/api/v1/topology/nodes', methods=['GET'])
+    def topo_nodes(self, req, **kwargs):
+        nodes = sorted(list(self.app.G.nodes()))
+        return j(nodes)
+
+    @route('topo_links', '/api/v1/topology/links', methods=['GET'])
+    def topo_links(self, req, **kwargs):
+        links = []
+        for u, v, data in self.app.G.edges(data=True):
+            links.append({
+                'src_dpid': u, 'dst_dpid': v,
+                'src_port': data.get('u_port'),
+                'dst_port': data.get('v_port')
+            })
+        return j(links)
+
+    @route('actions_list', '/api/v1/actions/list', methods=['GET'])
+    def actions_list(self, req, **kwargs):
+        out = []
+        for (s, d), meta in self.app.routes.items():
+            out.append({'src_mac': s, 'dst_mac': d,
+                        'cookie': meta.get('cookie'),
+                        'path': meta.get('path')})
+        return j(out)
+
+    @route('route_delete', '/api/v1/actions/route', methods=['DELETE'])
+    def route_delete(self, req, **kwargs):
+        p = req.params
+        s = p.get('src_mac'); d = p.get('dst_mac')
+        if not s or not d:
+            return j({'error': 'missing src_mac/dst_mac'}, 400)
+        key = (s, d)
+        meta = self.app.routes.get(key)
+        if not meta:
+            return j({'error': 'not_found'}, 404)
+
+        cookie = meta.get('cookie')
+        # Delete flows by cookie on all datapaths
+        for dp in list(self.app.datapaths.values()):
+            ofp = dp.ofproto
+            parser = dp.ofproto_parser
+            mod = parser.OFPFlowMod(
+                datapath=dp,
+                cookie=cookie, cookie_mask=0xffffffffffffffff,
+                table_id=ofp.OFPTT_ALL,
+                command=ofp.OFPFC_DELETE,
+                out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+                match=parser.OFPMatch()
+            )
+            dp.send_msg(mod)
+
+        self.app.routes.pop(key, None)
+        self.app.last_action_ts.pop(key, None)
+        return j({'status': 'deleted'})

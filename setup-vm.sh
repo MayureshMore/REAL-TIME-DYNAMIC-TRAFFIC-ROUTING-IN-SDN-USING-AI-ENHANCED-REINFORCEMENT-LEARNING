@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # setup-vm.sh — one-time VM bootstrap for the SDN controller on Ubuntu/RPi
 # - Installs APT deps (OVS, Mininet, build tools, tmux, curl, jq)
-# - Installs pyenv + Python 3.9.19
+# - Optionally installs pyenv + Python 3.9.19 (recommended)
 # - Creates venv "ryu39" and pins known-good Ryu deps
-# - Patches monitor_rest.py health() to return valid JSON
 
 set -euo pipefail
 
-PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_NAME="ryu39"
 PY_VER="3.9.19"
 PYENV_ROOT="${HOME}/.pyenv"
@@ -25,20 +23,20 @@ $SUDO apt-get install -y --no-install-recommends \
   libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
   libffi-dev liblzma-dev tk-dev \
   mininet openvswitch-switch python3-openvswitch \
-  iperf3 tshark socat net-tools
+  iperf3 tshark socat net-tools python3-venv
 
 echo "==> Enable + start Open vSwitch"
 $SUDO systemctl enable --now openvswitch-switch
 
 if [[ ! -d "${PYENV_ROOT}" ]]; then
-  echo "==> Installing pyenv"
+  echo "==> Installing pyenv (optional but recommended)"
   git clone https://github.com/pyenv/pyenv.git "${PYENV_ROOT}"
   git clone https://github.com/pyenv/pyenv-doctor.git "${PYENV_ROOT}/plugins/pyenv-doctor"
   git clone https://github.com/pyenv/pyenv-update.git "${PYENV_ROOT}/plugins/pyenv-update"
   git clone https://github.com/pyenv/pyenv-virtualenv.git "${PYENV_ROOT}/plugins/pyenv-virtualenv"
 fi
 
-# Ensure pyenv is available in this script AND for future shells
+# Ensure pyenv usable now and later
 if ! grep -q 'pyenv init - bash' ~/.bashrc 2>/dev/null; then
   cat >> ~/.bashrc <<'RC'
 export PYENV_ROOT="$HOME/.pyenv"
@@ -64,48 +62,11 @@ echo "==> Python deps (pinned, known-good for Ryu 4.34 on Py3.9)"
 "${PIP_BIN}" install \
   ryu==4.34 \
   eventlet==0.30.2 dnspython==1.16.0 webob==1.8.9 \
-  networkx requests jsonschema
+  networkx requests jsonschema routes netaddr msgpack \
+  matplotlib numpy torch --extra-index-url https://download.pytorch.org/whl/cpu
 
-echo "==> Patching monitor_rest.py health() to return proper JSON"
-APP="${PROJ_DIR}/controller-apps/monitor_rest.py"
-if [[ ! -f "${APP}" ]]; then
-  echo "ERROR: ${APP} not found. Are you in the repo root?" >&2
-  exit 1
-fi
-
-# Replace the health() body to ensure WebOb gets bytes (avoids charset TypeError)
-pyenv global 3.9.19
-pyenv local 3.9.19
-pyenv rehash
-sudo dpkg --configure -a
-
-python - "$APP" <<'PY'
-import io, os, re, sys
-p = sys.argv[1]
-src = io.open(p, 'r', encoding='utf-8').read()
-
-# Ensure json import exists
-if 'import json' not in src:
-    src = 'import json\n' + src
-
-# Replace/insert health() method robustly
-pat = re.compile(r'(\n\s*)def\s+health\s*\([^)]*\):\s*(?:\n\s+.*?)+?(?=\n\s*def|\n\s*class|\Z)', re.S)
-body = r"""\1def health(self, req, **kwargs):
-\1    # Always return valid JSON bytes for WebOb<=1.8.x
-\1    data = {"status": "ok", "last_stats_ts": getattr(self, "last_stats_ts", 0.0)}
-\1    payload = json.dumps(data)
-\1    from webob import Response
-\1    return Response(content_type="application/json", body=payload.encode("utf-8"))
-"""
-if pat.search(src):
-    src = pat.sub(body, src, count=1)
-else:
-    # Append if not found
-    src += body.replace(r"\1", "\n")
-
-io.open(p, 'w', encoding='utf-8').write(src)
-print("Patched:", p)
-PY
-
-echo "==> Done. Next: ./run-controller.sh   (or: WSAPI_PORT=8080 OF_PORT=6633 ./scripts/run_ryu.sh)"
-
+echo "==> Done."
+echo "Next steps:"
+echo "  1) Start controller:   WSAPI_PORT=8080 OF_PORT=6633 ./scripts/run_ryu.sh"
+echo "  2) Health check:       curl http://127.0.0.1:8080/api/v1/health"
+echo "  3) Launch topology:    sudo python3 scripts/topos/two_path.py --no_cli"
