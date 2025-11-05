@@ -24,7 +24,7 @@ log() { echo -e "\033[1;36m$*\033[0m"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # Ensure correct helper path (idempotent)
-sed -i 's#scripts/_ensure_controller.sh#scripts/ensure_controller.sh#g' "$0" 2>/dev/null || true
+sed -i 's#scripts/ensure_controller.sh#scripts/ensure_controller.sh#g' "$0" 2>/dev/null || true
 
 # Clean any leftovers (prevents RTNETLINK "File exists")
 log "[prep] sudo mn -c"
