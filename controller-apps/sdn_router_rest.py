@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
 # Unified SDN controller app: L2 learning + topology + routing + REST + stats
-# Improvements:
-# - Merged monitor_rest.py
-# - Added caching and safer error handling
-# - Improved cooldown + consistency
-# - Compatible with Bandit, LinUCB, and DQN agents
-# - No API auth per user request
 
 from collections import defaultdict
 import hashlib, json, time, networkx as nx
@@ -73,7 +67,6 @@ class SDNRouterREST(app_manager.RyuApp):
         wsgi.register(RESTController, {API_INSTANCE: self})
 
     # -------------------- OpenFlow base --------------------
-
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         dp = ev.msg.datapath
@@ -100,7 +93,6 @@ class SDNRouterREST(app_manager.RyuApp):
                                    if dp.id not in (k[0], k[1])}
 
     # -------------------- L2 Learning --------------------
-
     def _purge_hosts_on_port(self, dpid, port_no):
         bad = [m for m,h in self.hosts.items() if h['dpid']==dpid and h['port']==port_no]
         for mac in bad: self.hosts.pop(mac, None)
@@ -132,7 +124,6 @@ class SDNRouterREST(app_manager.RyuApp):
                                         in_port=in_port, actions=actions, data=msg.data))
 
     # -------------------- Topology & Links --------------------
-
     @set_ev_cls(topo_event.EventLinkAdd)
     def link_add(self, ev):
         u,v = ev.link.src.dpid, ev.link.dst.dpid
@@ -165,7 +156,6 @@ class SDNRouterREST(app_manager.RyuApp):
             hub.sleep(2)
 
     # -------------------- Stats --------------------
-
     def _monitor(self):
         while True:
             try:
@@ -212,7 +202,6 @@ class SDNRouterREST(app_manager.RyuApp):
         self.last_stats_ts=now
 
     # -------------------- Path Helpers --------------------
-
     def _k_shortest_paths(self, src, dst, k=2):
         if src==dst: return []
         key=(src,dst,k)
@@ -291,8 +280,9 @@ class RESTController(ControllerBase):
         out=[{'path_id':i,'dpids':p,'hops':self.app._path_ports(p,dst_mac=d)} for i,p in enumerate(paths)]
         return j(out)
 
-    @route('route', '/api/v1/actions/route', methods=['POST'])
-    def route(self, req, **kwargs):
+    # RENAMED: avoid shadowing the @route decorator
+    @route('action_route', '/api/v1/actions/route', methods=['POST'])
+    def apply_route(self, req, **kwargs):
         try:
             data=json.loads(req.body)
             validate(instance=data,schema=ROUTE_SCHEMA)
@@ -329,7 +319,6 @@ class RESTController(ControllerBase):
     def metrics_links(self,req,**kw): return j(self.app._links_with_tx_bps())
 
     # -------- Added to match OpenAPI/docs --------
-
     @route('topo_nodes', '/api/v1/topology/nodes', methods=['GET'])
     def topo_nodes(self, req, **kwargs):
         nodes = sorted(list(self.app.G.nodes()))
@@ -355,7 +344,7 @@ class RESTController(ControllerBase):
                         'path': meta.get('path')})
         return j(out)
 
-    @route('route_delete', '/api/v1/actions/route', methods=['DELETE'])
+    @route('action_route_delete', '/api/v1/actions/route', methods=['DELETE'])
     def route_delete(self, req, **kwargs):
         p = req.params
         s = p.get('src_mac'); d = p.get('dst_mac')
@@ -367,7 +356,6 @@ class RESTController(ControllerBase):
             return j({'error': 'not_found'}, 404)
 
         cookie = meta.get('cookie')
-        # Delete flows by cookie on all datapaths
         for dp in list(self.app.datapaths.values()):
             ofp = dp.ofproto
             parser = dp.ofproto_parser
