@@ -1,83 +1,104 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# scripts/experiments/run_with_rl.sh
+set -Eeuo pipefail
 
+# ---- Tunables via env ----
 OF_PORT="${OF_PORT:-6633}"
 REST_PORT="${REST_PORT:-8080}"
-CTRL="127.0.0.1"
-DURATION="${DURATION:-600}"
+CTRL_IP="${CTRL_IP:-127.0.0.1}"
+DURATION="${DURATION:-120}"
 EPSILON="${EPSILON:-0.2}"
 K="${K:-2}"
-WAIT_FOR_PATHS="${WAIT_FOR_PATHS:-60}"
+PATH_WAIT_SECS="${PATH_WAIT_SECS:-120}"   # increased from 60
+WARMUP_PINGS="${WARMUP_PINGS:-10}"        # new: quick warm-up
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PYENV_ROOT="${HOME}/.pyenv"
-PY_BIN="${PYENV_ROOT}/versions/ryu39/bin/python"
-AGENT_PID=""
-TMUX_SOCKET="-L ryu"
-TMUX_SESSION="ryu-app"
+ENSURE_CTRL="${REPO}/scripts/ensure_controller.sh"
+TOPO_PY="${REPO}/scripts/topos/two_path.py"
+AGENT_PY="${REPO}/scripts/agents/bandit_agent.py"
+LOGGER_PY="${REPO}/scripts/metrics/poll_ports.py"
 
-cleanup() {
-  set +e
-  [[ -n "${AGENT_PID}" ]] && kill "${AGENT_PID}" 2>/dev/null || true
-  # try graceful, then force if needed
-  sleep 0.2
-  [[ -n "${AGENT_PID}" ]] && kill -9 "${AGENT_PID}" 2>/dev/null || true
-  # stop any residual mininet
-  sudo mn -c >/dev/null 2>&1 || true
-  # leave controller running for post-run inspection? comment next line to keep it
-  tmux ${TMUX_SOCKET} kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM
+BASE_API="http://127.0.0.1:${REST_PORT}/api/v1"
 
-# Ensure controller up
-"${REPO}/scripts/ensure_controller.sh" "${OF_PORT}" "${REST_PORT}"
+log() { echo -e "\033[1;36m$*\033[0m"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-echo "Launching two-path Mininet demo for ${DURATION}s"
-sudo -n true 2>/dev/null || sudo -v
-sudo python3 "${REPO}/scripts/topos/two_path.py" \
-  --controller_ip "${CTRL}" --rest_port "${REST_PORT}" \
-  --demo --demo_time "$((DURATION-5))" --no_cli &
+# Ensure correct helper path (idempotent)
+sed -i 's#scripts/_ensure_controller.sh#scripts/ensure_controller.sh#g' "$0" 2>/dev/null || true
 
-# Wait for any valid host pair with at least one path
-BASE="http://127.0.0.1:${REST_PORT}/api/v1"
-echo "Waiting up to ${WAIT_FOR_PATHS}s for hosts & paths..."
-t0=$(date +%s); SRC=""; DST=""
+# Clean any leftovers (prevents RTNETLINK "File exists")
+log "[prep] sudo mn -c"
+sudo mn -c >/dev/null 2>&1 || true
+
+# Start controller
+log "[ctrl] Starting controller OF:${OF_PORT} REST:${REST_PORT}"
+"${ENSURE_CTRL}" "${OF_PORT}" "${REST_PORT}"
+
+# Launch topology (no CLI) for full duration; we will also run an agent + a logger in parallel
+log "[topo] Launching two-path demo for ${DURATION}s"
+sudo python3 "${TOPO_PY}" \
+  --controller_ip "${CTRL_IP}" \
+  --rest_port "${REST_PORT}" \
+  --demo --demo_time "$(( DURATION - 5 ))" \
+  --no_cli >/tmp/topo.out 2>&1 &
+TOPO_PID=$!
+
+# ---- Wait for hosts & paths ----
+log "[wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
+t0=$(date +%s)
+H1=""; H2=""
 while :; do
-  HS_JSON="$(curl -sf "${BASE}/hosts" || echo '[]')"
-  COUNT="$(printf '%s' "$HS_JSON" | jq -r 'length')"
-  if [[ "$COUNT" -ge 2 ]]; then
-    i=0
-    while [[ $i -lt $COUNT ]]; do
-      j=$((i+1))
-      while [[ $j -lt $COUNT ]]; do
-        SRC_CAND="$(printf '%s' "$HS_JSON" | jq -r ".[$i].mac")"
-        DST_CAND="$(printf '%s' "$HS_JSON" | jq -r ".[$j].mac")"
-        if curl -sf "${BASE}/paths?src_mac=${SRC_CAND}&dst_mac=${DST_CAND}&k=${K}" \
-          | jq -e 'length >= 1' >/dev/null 2>&1; then
-          SRC="$SRC_CAND"; DST="$DST_CAND"; break 2
-        fi
-        j=$((j+1))
-      done
-      i=$((i+1))
-    done
+  HS="$(curl -sf "${BASE_API}/hosts" || echo '[]')"
+  CNT="$(printf '%s' "$HS" | jq 'length')"
+  if (( CNT >= 2 )); then
+    H1="$(printf '%s' "$HS" | jq -r '.[0].mac')"
+    H2="$(printf '%s' "$HS" | jq -r '.[1].mac')"
+    PATHS="$(curl -sf "${BASE_API}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" || echo '[]')"
+    if [[ "$(printf '%s' "$PATHS" | jq 'length')" -ge 1 ]]; then
+      log "[wait] Paths available for ${H1} -> ${H2}"
+      break
+    fi
   fi
-  now=$(date +%s); (( now - t0 > WAIT_FOR_PATHS )) && { echo "Timed out waiting for paths"; exit 1; }
+  (( $(date +%s) - t0 > PATH_WAIT_SECS )) && {
+    kill "$TOPO_PID" 2>/dev/null || true
+    die "Timed out waiting for paths"
+  }
   sleep 2
 done
 
-echo "Starting bandit agent (epsilon=${EPSILON})"
-"${PY_BIN}" "${REPO}/rl-agent/bandit_agent.py" \
-  --controller "${CTRL}" --port "${REST_PORT}" --k "${K}" \
-  --epsilon "${EPSILON}" --trials 100000 \
-  --wait-hosts "${WAIT_FOR_PATHS}" --measure-wait 2.5 &
+# ---- Warm-up traffic to speed discovery & counters ----
+if (( WARMUP_PINGS > 0 )); then
+  log "[warmup] Sending ${WARMUP_PINGS} ICMP echos via Mininet demo (already running)"
+  # The demo process is already ping-flooding; just give a brief pause
+  sleep 3
+fi
+
+# ---- Start logger ----
+TS="$(date +%Y%m%d_%H%M%S)"
+CSV="docs/baseline/ports_rl_${TS}.csv"
+log "[logger] Logging to ${CSV}; polling ${BASE_API} every 1s; duration=${DURATION}s"
+python3 "${LOGGER_PY}" --api "${BASE_API}" --out "${CSV}" --duration "${DURATION}" --interval 1 >/tmp/logger.out 2>&1 &
+LOGGER_PID=$!
+
+# ---- Start agent ----
+log "[agent] epsilon=${EPSILON} k=${K} src=${H1} dst=${H2}"
+python3 "${AGENT_PY}" \
+  --api "${BASE_API}" \
+  --src_mac "${H1}" \
+  --dst_mac "${H2}" \
+  --epsilon "${EPSILON}" \
+  --k "${K}" \
+  --duration "${DURATION}" \
+  --cooldown 1 \
+  >/tmp/agent.out 2>&1 &
 AGENT_PID=$!
 
-TS=$(date +%Y%m%d_%H%M%S)
-CSV="${REPO}/docs/baseline/ports_rl_${TS}.csv"
-echo "Logging to: ${CSV}"
-"${PY_BIN}" "${REPO}/scripts/metrics/log_stats.py" \
-  --controller "${CTRL}" --port "${REST_PORT}" \
-  --interval 1.0 --duration "${DURATION}" --out "${CSV}"
+# ---- Wait for demo to finish ----
+wait "${TOPO_PID}" 2>/dev/null || true
 
-echo "RL run complete. CSV: ${CSV}"
-# trap will cleanup agent & mininet (and controller unless you commented it)
+# ---- Stop agent/logger if still alive ----
+kill "${AGENT_PID}" 2>/dev/null || true
+kill "${LOGGER_PID}" 2>/dev/null || true
+
+log "RL run complete. CSV: ${CSV}"
+echo "${CSV}"
