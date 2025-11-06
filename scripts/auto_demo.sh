@@ -139,32 +139,44 @@ wait_for_paths() {
   local timeout_sec="${1:-$PATH_WAIT_SECS}"
   local deadline=$(( $(date +%s) + timeout_sec ))
 
-  local hosts_json paths_json H1 H2
+  local hosts_json macs_line H1 H2 paths_ok="false"
 
   while [ "$(date +%s)" -lt "${deadline}" ]; do
+    # Pull hosts; require at least two valid MAC strings
     hosts_json="$(curl -sf "${API_BASE}/hosts" 2>/dev/null || echo '[]')"
-    if [ "$(jq -r 'type=="array" and length>=2' <<<"${hosts_json}")" = "true" ]; then
-      H1="$(jq -r '.[0].mac // empty' <<<"${hosts_json}")"
-      H2="$(jq -r '.[1].mac // empty' <<<"${hosts_json}")"
 
-      if [[ "${H1}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ && "${H2}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
-        # Ask both directions to warm caches
-        curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null || true
-        curl -sf "${API_BASE}/paths?src_mac=${H2}&dst_mac=${H1}&k=${K}" >/dev/null || true
-        sleep 1
-        paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" 2>/dev/null || echo '[]')"
+    macs_line="$(
+      jq -r '
+        # collect all string MACs that match AA:BB:CC:DD:EE:FF
+        [ .[] | .mac? | strings
+          | select(test("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$"))
+        ]
+        | select(length>=2)
+        | "\(. [0]) \(. [1])"
+      ' <<<"${hosts_json}" 2>/dev/null || true
+    )"
 
-        # Accept either array of objects with dpids/hops/path_id, or any non-empty array (older payloads)
-        if [ "$(jq -r 'type=="array" and length>0 and ( (.[0]|type=="object") or (.[0]|type=="array") or (.[0]|type=="number") )' <<<"${paths_json}")" = "true" ]; then
-          printf "%s\n" "${H1} ${H2}"
-          return 0
-        fi
+    if [ -n "${macs_line}" ]; then
+      # shellcheck disable=SC2086
+      read -r H1 H2 <<<"${macs_line}"
+
+      # Warm both directions to populate k-path cache
+      curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null || true
+      curl -sf "${API_BASE}/paths?src_mac=${H2}&dst_mac=${H1}&k=${K}" >/dev/null || true
+      sleep 1
+
+      # Verify paths exist from H1->H2
+      if curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
+        printf "%s %s\n" "${H1}" "${H2}"
+        return 0
       fi
     fi
     sleep 1
   done
+
   return 1
 }
+
 
 run_rl() {
   step "4) RL run for ${RL_DURATION}s (epsilon=${EPSILON}, k=${K})"
@@ -177,33 +189,40 @@ run_rl() {
   WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
 
   say "  [topo] Launching two-path demo for ${RL_DURATION}s"
-  python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${RL_DURATION}" > /tmp/topo_rl.out 2>&1 &
+  python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${RL_DURATION}" > /tmp/topo_rl.out 2>&1 & topo_pid=$!
 
   say "  [wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
-  if read -r H1 H2 <<<"$(wait_for_paths "${PATH_WAIT_SECS}")"; then
-    say "  [wait] Paths available for ${H1} -> ${H2}"
-  else
+  macs="$(wait_for_paths "${PATH_WAIT_SECS}")" || {
     say "  [x] timed out waiting for hosts/paths; check controller logs"
+    [ -n "${topo_pid:-}" ] && kill "${topo_pid}" 2>/dev/null || true
+    exit 1
+  }
+
+  # shellcheck disable=SC2086
+  read -r H1 H2 <<<"${macs}"
+  if [ -z "${H1}" ] || [ -z "${H2}" ]; then
+    say "  [x] internal error: empty H1/H2 after path wait"
+    [ -n "${topo_pid:-}" ] && kill "${topo_pid}" 2>/dev/null || true
     exit 1
   fi
+  say "  [wait] Paths available for ${H1} -> ${H2}"
 
-  # Run RL experiment (logger+agent managed by run_with_rl.sh)
-  export DURATION="${RL_DURATION}" EPSILON="${EPSILON}" K="${K}" CTRL_HOST="${CTRL_HOST}" WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}"
+  # Export MACs so the RL runner/agent use exactly these endpoints
+  export DURATION="${RL_DURATION}" EPSILON="${EPSILON}" K="${K}"
+  export SRC_MAC="${H1}" DST_MAC="${H2}" CTRL_HOST="${CTRL_HOST}" WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}"
 
+  # Run RL (capture logs)
   OUT=$(
-    DURATION="${RL_DURATION}" EPSILON="${EPSILON}" K="${K}" \
-      bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
+    bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
   )
 
-  # Extract CSV path from output; if missing, fall back to newest RL CSV
-  RL_CANDIDATE="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
-  if [ -n "${RL_CANDIDATE}" ]; then
-    RL_CSV="${REPO}/${RL_CANDIDATE#${REPO}/}"
-  else
+  # Prefer the path echoed by the runner; otherwise choose newest RL CSV
+  RL_CSV="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
+  if [ -z "${RL_CSV}" ]; then
     RL_CSV="$(ls -1t "${CSV_DIR}"/ports_rl_*.csv 2>/dev/null | head -n1 || true)"
   fi
 
-  if [ -n "${RL_CSV}" ]; then
+  if [ -n "${RL_CSV}" ] && [ -f "${RL_CSV}" ]; then
     say "  RL CSV: ${RL_CSV}"
   else
     say "  [!] RL CSV not found. See /tmp/rl.out and /tmp/rl.err"
@@ -219,7 +238,11 @@ run_rl() {
     fi
     sleep 10
   done
+
+  # Let the short-lived topo finish quietly
+  [ -n "${topo_pid:-}" ] && wait "${topo_pid}" 2>/dev/null || true
 }
+
 
 plot_results() {
   step "5) Plotting results"
