@@ -7,7 +7,7 @@ OF_PORT="${OF_PORT:-6633}"
 WSAPI_PORT="${WSAPI_PORT:-8080}"
 CTRL_HOST="${CTRL_HOST:-127.0.0.1}"
 
-# How long to keep the quick sanity topo alive (seconds)
+# Keep the quick sanity topo alive
 SANITY_SECS="${SANITY_SECS:-15}"
 
 # Baseline + RL durations
@@ -19,7 +19,7 @@ EPSILON="${EPSILON:-0.2}"
 K="${K:-2}"
 
 # How long to wait for hosts + k-paths to materialize
-PATH_WAIT_SECS="${PATH_WAIT_SECS:-150}"
+PATH_WAIT_SECS="${PATH_WAIT_SECS:-180}"
 
 ENSURE="${REPO}/scripts/ensure_controller.sh"
 TOPO="${REPO}/scripts/topos/two_path.py"
@@ -59,11 +59,8 @@ patch_once() {
 
 clean_start() {
   step "0) Clean start"
-  # Mininet cleanup (quiet, resilient)
   sudo mn -c    >/dev/null 2>&1 || true
-  # The pattern mininet: can be weird; match safely and ignore failures
   sudo pkill -9 -f 'mininet($|:)' >/dev/null 2>&1 || true
-  # OVS residuals, temp files
   rm -f /tmp/vconn* /tmp/vlogs* /tmp/*.out /tmp/*.log 2>/dev/null || true
   rm -f ~/.ssh/mn/* 2>/dev/null || true
   say "  Cleanup complete."
@@ -77,36 +74,34 @@ start_controller() {
 
 sanity_topo() {
   step "2) Sanity topology up for ~${SANITY_SECS}s"
-
   say "  Waiting for graph (hosts & k-paths)..."
-  # Launch short demo in background; keep output compact in a file
   python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${SANITY_SECS}" > /tmp/topo_sanity.out 2>&1 &
 
-  # Poll a few times while the topo is alive
   end=$(( $(date +%s) + SANITY_SECS ))
   printed=0
   while [ "$(date +%s)" -lt "${end}" ]; do
-    nodes="$(curl -sf "${API_BASE}/topology/nodes"    | jq -c '.')" || nodes="[]"
-    links="$(curl -sf "${API_BASE}/topology/links"    | jq -c '.')" || links="[]"
-    hosts="$(curl -sf "${API_BASE}/hosts"             | jq -c '.')" || hosts="[]"
+    nodes="$(curl -sf "${API_BASE}/topology/nodes"    | jq -c '.' 2>/dev/null || echo '[]')"
+    links="$(curl -sf "${API_BASE}/topology/links"    | jq -c '.' 2>/dev/null || echo '[]')"
+    hosts="$(curl -sf "${API_BASE}/hosts"             | jq -c '.' 2>/dev/null || echo '[]')"
 
-    [ $printed -eq 0 ] && {
-      say "  nodes: $(jq -c '.' <<<"${nodes}")"
-      say "  links: $(jq -c '.' <<<"${links}")"
-      say "  hosts: $(jq -c '.' <<<"${hosts}")"
+    if [ $printed -eq 0 ] && [ "$(jq -r 'type=="array" and length>0' <<<"${nodes}")" = "true" ]; then
+      say "  nodes: ${nodes}"
+      say "  links: ${links}"
+      say "  hosts: ${hosts}"
       printed=1
-    }
+    fi
 
-    # If we have 2 hosts, try to fetch k-paths for H1->H2
-    if [ "$(jq 'length' <<<"${hosts}")" -ge 2 ]; then
-      H1="$(jq -r '.[0].mac' <<<"${hosts}")"
-      H2="$(jq -r '.[1].mac' <<<"${hosts}")"
-      paths="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=2" | jq -c '.')" || paths="[]"
-
-      if [ "$(jq 'length' <<<"${paths}")" -ge 1 ]; then
-        say "  paths: ${paths}"
-        say "  Graph healthy: ≥2 hosts and ≥1 path between ${H1} → ${H2}"
-        break
+    if [ "$(jq -r 'type=="array" and length>=2' <<<"${hosts}")" = "true" ]; then
+      H1="$(jq -r '.[0].mac // empty' <<<"${hosts}")"
+      H2="$(jq -r '.[1].mac // empty' <<<"${hosts}")"
+      if [[ "${H1}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ && "${H2}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        paths="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=2" | jq -c '.' 2>/dev/null || echo '[]')"
+        # accept either array of objects with dpids/hops, or any non-empty array
+        if [ "$(jq -r 'type=="array" and length>0' <<<"${paths}")" = "true" ]; then
+          say "  paths: ${paths}"
+          say "  Graph healthy: ≥2 hosts and ≥1 path between ${H1} → ${H2}"
+          break
+        fi
       fi
     fi
     sleep 1
@@ -115,12 +110,10 @@ sanity_topo() {
 
 run_baseline() {
   step "3) Baseline run for ${BASELINE_DURATION}s"
-  # The baseline script will bring up its own short-lived topology
   export DURATION="${BASELINE_DURATION}"
-  # Keep output reasonably readable
   CSV=$(
     DURATION="${BASELINE_DURATION}" bash "${RUN_BASELINE}" \
-      2>/tmp/baseline.err | tee /tmp/baseline.out | awk '/CSV: /{print $NF}'
+      2>/tmp/baseline.err | tee /tmp/baseline.out | awk '/CSV: /{print $NF}' | tail -n1
   )
   CSV="${CSV:-}"
   if [ -z "${CSV}" ]; then
@@ -131,7 +124,6 @@ run_baseline() {
 
   say
   say "  Live peek: ${CSV} (every 10s for 60s)"
-  # Compact peek (cut first few rows only when present)
   for _ in {1..6}; do
     if [ -f "${CSV}" ]; then
       tail -n 12 "${CSV}" | sed 's/[[:space:]]\+$//' | indent
@@ -142,31 +134,31 @@ run_baseline() {
   done
 }
 
+# robust H1/H2/path discovery with validation
 wait_for_paths() {
   local timeout_sec="${1:-$PATH_WAIT_SECS}"
   local deadline=$(( $(date +%s) + timeout_sec ))
 
   local hosts_json paths_json H1 H2
+
   while [ "$(date +%s)" -lt "${deadline}" ]; do
-    hosts_json="$(curl -sf "${API_BASE}/hosts" || echo '[]')"
-    if [ "$(jq 'length' <<<"${hosts_json}")" -ge 2 ]; then
-      H1="$(jq -r '.[0].mac' <<<"${hosts_json}")"
-      H2="$(jq -r '.[1].mac' <<<"${hosts_json}")"
+    hosts_json="$(curl -sf "${API_BASE}/hosts" 2>/dev/null || echo '[]')"
+    if [ "$(jq -r 'type=="array" and length>=2' <<<"${hosts_json}")" = "true" ]; then
+      H1="$(jq -r '.[0].mac // empty' <<<"${hosts_json}")"
+      H2="$(jq -r '.[1].mac // empty' <<<"${hosts_json}")"
 
-      # "Kick" MAC learning if needed (lightweight ping request to controller via demo already running)
-      # Also ask for k=K paths explicitly to populate cache
-      paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" || echo '[]')"
-
-      # If still zero, try the reverse direction once to warm both ways
-      if [ "$(jq 'length' <<<"${paths_json}")" -eq 0 ]; then
+      if [[ "${H1}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ && "${H2}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        # Ask both directions to warm caches
+        curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null || true
         curl -sf "${API_BASE}/paths?src_mac=${H2}&dst_mac=${H1}&k=${K}" >/dev/null || true
         sleep 1
-        paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" || echo '[]')"
-      fi
+        paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" 2>/dev/null || echo '[]')"
 
-      if [ "$(jq 'length' <<<"${paths_json}")" -ge 1 ]; then
-        printf "%s\n" "${H1} ${H2}"
-        return 0
+        # Accept either array of objects with dpids/hops/path_id, or any non-empty array (older payloads)
+        if [ "$(jq -r 'type=="array" and length>0 and ( (.[0]|type=="object") or (.[0]|type=="array") or (.[0]|type=="number") )' <<<"${paths_json}")" = "true" ]; then
+          printf "%s\n" "${H1} ${H2}"
+          return 0
+        fi
       fi
     fi
     sleep 1
@@ -178,19 +170,15 @@ run_rl() {
   step "4) RL run for ${RL_DURATION}s (epsilon=${EPSILON}, k=${K})"
   patch_once
 
-  # Clean any previous topo strongly to avoid interface-pair reuse
   say "  [prep] sudo mn -c"
   sudo mn -c >/dev/null 2>&1 || true
 
-  # Start controller (ensure script handles idempotency)
   say "  [ctrl] Starting controller OF:${OF_PORT} REST:${WSAPI_PORT}"
   WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
 
-  # Launch the two-path demo in the background for RL duration
   say "  [topo] Launching two-path demo for ${RL_DURATION}s"
   python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${RL_DURATION}" > /tmp/topo_rl.out 2>&1 &
 
-  # Wait for hosts & paths (more patient and warms both directions)
   say "  [wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
   if read -r H1 H2 <<<"$(wait_for_paths "${PATH_WAIT_SECS}")"; then
     say "  [wait] Paths available for ${H1} -> ${H2}"
@@ -199,16 +187,27 @@ run_rl() {
     exit 1
   fi
 
-  # Run RL experiment (logger+agent are managed by run_with_rl.sh)
+  # Run RL experiment (logger+agent managed by run_with_rl.sh)
   export DURATION="${RL_DURATION}" EPSILON="${EPSILON}" K="${K}" CTRL_HOST="${CTRL_HOST}" WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}"
+
   OUT=$(
     DURATION="${RL_DURATION}" EPSILON="${EPSILON}" K="${K}" \
       bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
   )
 
-  # Extract CSV path printed by run_with_rl.sh
-  RL_CSV="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
-  [ -n "${RL_CSV}" ] && say "  RL CSV: ${RL_CSV}"
+  # Extract CSV path from output; if missing, fall back to newest RL CSV
+  RL_CANDIDATE="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
+  if [ -n "${RL_CANDIDATE}" ]; then
+    RL_CSV="${REPO}/${RL_CANDIDATE#${REPO}/}"
+  else
+    RL_CSV="$(ls -1t "${CSV_DIR}"/ports_rl_*.csv 2>/dev/null | head -n1 || true)"
+  fi
+
+  if [ -n "${RL_CSV}" ]; then
+    say "  RL CSV: ${RL_CSV}"
+  else
+    say "  [!] RL CSV not found. See /tmp/rl.out and /tmp/rl.err"
+  fi
 
   say
   say "  Live peek: ${RL_CSV:-<unknown>} (every 10s for 60s)"
@@ -225,7 +224,6 @@ run_rl() {
 plot_results() {
   step "5) Plotting results"
   mkdir -p "${PLOTS_DIR}"
-  # Be tolerant if pandas/matplotlib aren't installed; tell the user clearly
   if ! python3 -c "import pandas, matplotlib" >/dev/null 2>&1; then
     say "  [!] pandas/matplotlib not found in this env. Install with:"
     say "      pip install pandas matplotlib"
