@@ -20,6 +20,7 @@ AGENT="${AGENT:-${REPO}/rl-agent/bandit_agent.py}"   # <-- fixed path here
 
 ENSURE="${REPO}/scripts/ensure_controller.sh"
 TOPO="${REPO}/scripts/topos/two_path.py"
+REUSE_TOPOLOGY="${REUSE_TOPOLOGY:-0}"
 
 CSV_DIR="${REPO}/docs/baseline"
 mkdir -p "${CSV_DIR}"
@@ -35,46 +36,85 @@ need curl
 need jq
 need python3
 
-# make sure ensure_controller.sh is referenced correctly (your auto_demo may also patch this)
+# make sure ensure_controller.sh path sane
 if ! grep -q "ensure_controller.sh" <<<"${ENSURE}"; then
   die "ENSURE path looks wrong: ${ENSURE}"
 fi
 
-echo "[prep] sudo mn -c"
-sudo mn -c >/dev/null 2>&1 || true
+if [ "${REUSE_TOPOLOGY}" = "1" ]; then
+  echo "[prep] Reusing existing controller/topology (skipping mn -c + ensure_controller)"
+else
+  echo "[prep] sudo mn -c"
+  sudo mn -c >/dev/null 2>&1 || true
 
-echo "[ctrl] Starting controller OF:${OF_PORT} REST:${WSAPI_PORT}"
-WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
+  echo "[ctrl] Starting controller OF:${OF_PORT} REST:${WSAPI_PORT}"
+  WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
+fi
 
-echo "[topo] Launching two-path demo for ${DURATION}s"
-# kick off the topology run in the background, so we can wait for graph + run agent/logger
-python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${DURATION}" > /tmp/topo.out 2>&1 &
+TOPO_PID=""
+if [ "${REUSE_TOPOLOGY}" = "1" ]; then
+  echo "[topo] Reusing externally managed two-path demo"
+else
+  echo "[topo] Launching two-path demo for ${DURATION}s"
+  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${DURATION}" > /tmp/topo.out 2>&1 &
+  TOPO_PID=$!
+fi
 
 # wait for hosts + paths to be ready
 echo "[wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
 deadline=$(( $(date +%s) + PATH_WAIT_SECS ))
-H1=""
-H2=""
+H1="${SRC_MAC:-}"
+H2="${DST_MAC:-}"
 
-while [ "$(date +%s)" -lt "${deadline}" ]; do
-  hosts_json="$(curl -sf "${API_BASE}/hosts" || echo "[]")"
-  host_count="$(jq 'length' <<<"${hosts_json}")"
-
-  if [ "${host_count}" -ge 2 ]; then
-    H1="$(jq -r '.[0].mac' <<<"${hosts_json}")"
-    H2="$(jq -r '.[1].mac' <<<"${hosts_json}")"
-    paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" || echo "[]")"
-    path_count="$(jq 'length' <<<"${paths_json}")"
-    if [ "${path_count}" -ge 1 ]; then
-      echo "[wait] Paths available for ${H1} -> ${H2}"
-      break
-    fi
+if [ -n "${H1}" ] && [ -n "${H2}" ]; then
+  echo "[wait] Using provided MACs ${H1} -> ${H2}"
+  # sanity check that controller sees them
+  if ! curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null; then
+    echo "[wait] Provided MACs not ready yet; falling back to discovery"
+    H1=""; H2=""
   fi
-  sleep 1
-done
+fi
 
 if [ -z "${H1}" ] || [ -z "${H2}" ]; then
+  attempt=0
+  while [ "$(date +%s)" -lt "${deadline}" ]; do
+    attempt=$((attempt+1))
+    hosts_json="$(curl -sf "${API_BASE}/hosts" || echo "[]")"
+    path_count=0
+    host_count="$(jq 'length' <<<"${hosts_json}")"
+
+    if [ "${host_count}" -ge 2 ]; then
+      H1="$(jq -r '.[0].mac' <<<"${hosts_json}")"
+      H2="$(jq -r '.[1].mac' <<<"${hosts_json}")"
+      paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" || echo "[]")"
+      path_count="$(jq 'length' <<<"${paths_json}")"
+      if [ "${path_count}" -ge 1 ]; then
+        echo "[wait] Paths available for ${H1} -> ${H2}"
+        break
+      fi
+    fi
+    if (( attempt % 10 == 0 )); then
+      echo "[wait] attempt ${attempt}: hosts=${host_count}, paths=${path_count:-0}"
+    fi
+    sleep 1
+  done
+fi
+
+if [ -z "${H1}" ] || [ -z "${H2}" ]; then
+  echo "[wait] timed out waiting for hosts/paths; see logs below" >&2
+  if [ -f /tmp/topo.out ]; then
+    echo "[debug] tail /tmp/topo.out" >&2
+    tail -n 40 /tmp/topo.out >&2
+  fi
+  if [ -f "${HOME}/ryu-controller.log" ]; then
+    echo "[debug] tail ~/ryu-controller.log" >&2
+    tail -n 40 "${HOME}/ryu-controller.log" >&2
+  fi
   die "timed out waiting for hosts/paths; check controller logs"
+fi
+
+if [ "${REUSE_TOPOLOGY}" = "1" ]; then
+  echo "[wait] Confirmed paths for ${H1} -> ${H2} on reused topology"
 fi
 
 echo "[warmup] Sending ${WARMUP_PINGS} ICMP echos via Mininet demo (already running)"
@@ -104,6 +144,10 @@ TAIL_PID=$!
 # wait for background jobs (topo+logger+agent)
 wait
 kill "${TAIL_PID}" >/dev/null 2>&1 || true
+
+if [ -n "${TOPO_PID}" ]; then
+  wait "${TOPO_PID}" 2>/dev/null || true
+fi
 
 echo "RL run complete. CSV: ${CSV_OUT}"
 echo "${CSV_OUT}"

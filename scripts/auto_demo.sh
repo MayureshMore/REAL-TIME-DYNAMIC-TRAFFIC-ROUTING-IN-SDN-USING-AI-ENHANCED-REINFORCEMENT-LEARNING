@@ -139,9 +139,10 @@ wait_for_paths() {
   local timeout_sec="${1:-$PATH_WAIT_SECS}"
   local deadline=$(( $(date +%s) + timeout_sec ))
 
-  local hosts_json macs_line H1 H2 paths_ok="false"
+  local hosts_json macs_line H1 H2 paths_ok="false" attempts=0
 
   while [ "$(date +%s)" -lt "${deadline}" ]; do
+    attempts=$((attempts+1))
     # Pull hosts; require at least two valid MAC strings
     hosts_json="$(curl -sf "${API_BASE}/hosts" 2>/dev/null || echo '[]')"
 
@@ -170,6 +171,10 @@ wait_for_paths() {
         printf "%s %s\n" "${H1}" "${H2}"
         return 0
       fi
+    else
+      if (( attempts % 10 == 0 )); then
+        say "  [wait] Hosts not ready yet (attempt ${attempts}); latest payload: ${hosts_json}"
+      fi
     fi
     sleep 1
   done
@@ -189,11 +194,19 @@ run_rl() {
   WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
 
   say "  [topo] Launching two-path demo for ${RL_DURATION}s"
-  python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${RL_DURATION}" > /tmp/topo_rl.out 2>&1 & topo_pid=$!
+  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${RL_DURATION}" > /tmp/topo_rl.out 2>&1 & topo_pid=$!
 
   say "  [wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
   macs="$(wait_for_paths "${PATH_WAIT_SECS}")" || {
     say "  [x] timed out waiting for hosts/paths; check controller logs"
+    if [ -f /tmp/topo_rl.out ]; then
+      say "  [debug] tail /tmp/topo_rl.out"
+      tail -n 40 /tmp/topo_rl.out | indent
+    fi
+    if [ -f "${HOME}/ryu-controller.log" ]; then
+      say "  [debug] tail ~/ryu-controller.log"
+      tail -n 40 "${HOME}/ryu-controller.log" | indent
+    fi
     [ -n "${topo_pid:-}" ] && kill "${topo_pid}" 2>/dev/null || true
     exit 1
   }
@@ -210,6 +223,7 @@ run_rl() {
   # Export MACs so the RL runner/agent use exactly these endpoints
   export DURATION="${RL_DURATION}" EPSILON="${EPSILON}" K="${K}"
   export SRC_MAC="${H1}" DST_MAC="${H2}" CTRL_HOST="${CTRL_HOST}" WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}"
+  export REUSE_TOPOLOGY=1
 
   # Run RL (capture logs)
   OUT=$(
