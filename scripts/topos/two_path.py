@@ -42,41 +42,60 @@ def build_two_path(ctrl_ip, ctrl_port, args):
     info("\n*** Starting Mininet\n")
     net.start()
 
-    info(f"*** Controller: {ctrl_ip}:{ctrl_port}\n")
-    info(f"*** Path A: s1-s2 | delay={args.delay_a} loss={args.loss_a}% bw={args.bw}Mbps\n")
-    info(f"*** Path B: s1-s3-s2 | delays={args.delay_b1}+{args.delay_b2}, losses={args.loss_b1}%+{args.loss_b2}%\n")
-    info(f"*** Hosts: {h1.IP()} <-> {h2.IP()}\n")
+    try:
+        info(f"*** Controller: {ctrl_ip}:{ctrl_port}\n")
+        info(f"*** Path A: s1-s2 | delay={args.delay_a} loss={args.loss_a}% bw={args.bw}Mbps\n")
+        info(f"*** Path B: s1-s3-s2 | delays={args.delay_b1}+{args.delay_b2}, losses={args.loss_b1}%+{args.loss_b2}%\n")
+        info(f"*** Hosts: {h1.IP()} <-> {h2.IP()}\n")
 
-    # Output config JSON (for reproducibility)
-    os.makedirs("docs/baseline", exist_ok=True)
-    config_path = f"docs/baseline/topo_config_{int(time.time())}.json"
-    cfg = {
-        "controller": f"{ctrl_ip}:{ctrl_port}",
-        "bw": args.bw,
-        "pathA": {"delay": args.delay_a, "loss": args.loss_a},
-        "pathB": {"delay1": args.delay_b1, "delay2": args.delay_b2,
-                  "loss1": args.loss_b1, "loss2": args.loss_b2}
-    }
-    with open(config_path, "w") as f:
-        json.dump(cfg, f, indent=2)
-    info(f"*** Configuration saved: {config_path}\n")
+        # Output config JSON (for reproducibility)
+        os.makedirs("docs/baseline", exist_ok=True)
+        config_path = f"docs/baseline/topo_config_{int(time.time())}.json"
+        cfg = {
+            "controller": f"{ctrl_ip}:{ctrl_port}",
+            "bw": args.bw,
+            "pathA": {"delay": args.delay_a, "loss": args.loss_a},
+            "pathB": {"delay1": args.delay_b1, "delay2": args.delay_b2,
+                      "loss1": args.loss_b1, "loss2": args.loss_b2}
+        }
+        with open(config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        info(f"*** Configuration saved: {config_path}\n")
 
-    # Demo mode (optional)
-    if args.demo:
-        info(f"*** Running demo ping flood for {args.demo_time}s\n")
-        h1.cmdPrint(f"ping -c {args.demo_time} {h2.IP()} &")
-        time.sleep(args.demo_time)
-        info("*** Demo completed.\n")
+        # Demo mode (optional)
+        if args.demo:
+            info(f"*** Running demo ping flood for {args.demo_time}s\n")
+            h1.cmdPrint(f"ping -c {args.demo_time} {h2.IP()} &")
+            time.sleep(args.demo_time)
+            info("*** Demo completed.\n")
 
-    if args.no_cli:
-        info("*** Running pingAll (no CLI mode)\n")
-        result = net.pingAll()
-        info(f"*** PingAll result: {result}\n")
+        if args.no_cli:
+            info("*** Running pingAll (no CLI mode)\n")
+            result = net.pingAll()
+            info(f"*** PingAll result: {result}\n")
+
+            duration = max(0, getattr(args, "duration", 0))
+            keepalive = max(0.0, getattr(args, "keepalive_interval", 1.0))
+            if duration > 0:
+                info(f"*** Headless mode: keeping topology up for {duration}s\n")
+                deadline = time.time() + duration
+                while True:
+                    now = time.time()
+                    if now >= deadline:
+                        break
+                    if keepalive > 0:
+                        h1.cmd(f"ping -c 1 -W 1 {h2.IP()} >/dev/null 2>&1")
+                        sleep_time = min(keepalive, max(0.0, deadline - time.time()))
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+                    else:
+                        time.sleep(min(1.0, deadline - now))
+            return
+
+        CLI(net)
+    finally:
+        info("*** Stopping Mininet\n")
         net.stop()
-        return
-
-    CLI(net)
-    net.stop()
 
 def main():
     setLogLevel("info")
@@ -96,9 +115,13 @@ def main():
     ap.add_argument("--loss_b1", type=float, default=0.0, help="Loss from s1->s3 (%)")
     ap.add_argument("--loss_b2", type=float, default=0.0, help="Loss from s3->s2 (%)")
 
-    ap.add_argument("--no_cli", action="store_true", help="Exit after pingAll (no interactive CLI)")
+    ap.add_argument("--no_cli", action="store_true", help="Exit after running warmups (no interactive CLI)")
     ap.add_argument("--demo", action="store_true", help="Run demo ping flood")
     ap.add_argument("--demo_time", type=int, default=20, help="Seconds for demo")
+    ap.add_argument("--duration", type=int, default=0,
+                    help="Headless mode: keep topology active for this many seconds (0=exit immediately)")
+    ap.add_argument("--keepalive_interval", type=float, default=1.0,
+                    help="In headless mode, send keepalive pings every N seconds (0=disable)")
 
     args = ap.parse_args()
 
