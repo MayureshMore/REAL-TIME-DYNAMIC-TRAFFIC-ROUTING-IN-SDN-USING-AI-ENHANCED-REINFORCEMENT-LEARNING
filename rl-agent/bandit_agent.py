@@ -1,218 +1,169 @@
 #!/usr/bin/env python3
-# Enhanced Epsilon-Greedy Bandit Agent for SDN Path Selection
-# -----------------------------------------------------------
-# Improvements:
-# - Persistent Q-values (saved to q_values.json)
-# - Adaptive epsilon decay
-# - Normalized throughput-based reward
-# - Robust handling of 429/409 API responses
-# - Compatible with DQN and LinUCB comparison
+# scripts/agents/bandit_agent.py
+#
+# Minimal epsilon-greedy bandit that flips between k paths from the controller:
+#   GET  /api/v1/paths?src_mac=..&dst_mac=..&k=K
+#   POST /api/v1/actions/route {"src_mac","dst_mac","path_id","k"}
+# Reward proxy: inverse of average tx_bytes increase per hop over the sample window
+# (higher reward → lighter path). This is simplistic but works as a demo.
 
-import argparse, time, random, sys, requests, json, os
-from collections import defaultdict
+import argparse, json, random, sys, time, urllib.request, urllib.error
+from statistics import mean
 
-SAVE_FILE = "q_values.json"
-MAX_BW = 10_000_000.0  # assume 10 Mbps link
-DECAY_RATE = 0.995
+def jget(url, timeout=3.0):
+    req = urllib.request.Request(url, headers={"Accept":"application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
 
-def api_base(host, port): return f"http://{host}:{port}/api/v1"
+def jpost(url, payload, timeout=3.0):
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type":"application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
 
-def _get(url, timeout=6.0):
-    try:
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print("[agent] GET failed:", e)
-        return None
-
-def _post(url, payload, timeout=8.0):
-    try:
-        r = requests.post(url, json=payload, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print("[agent] POST failed:", e)
-        raise
-
-def get_hosts(base): return _get(f"{base}/hosts") or []
-def get_ports(base): return _get(f"{base}/stats/ports") or []
-def get_paths(base, src, dst, k): return _get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}") or []
-
-def post_route(base, src, dst, path_id=None, path=None, k=2):
-    payload = {'src_mac': src, 'dst_mac': dst, 'k': k}
-    if path_id is not None: payload['path_id'] = int(path_id)
-    if path is not None: payload['path'] = list(path)
-    return _post(f"{base}/actions/route", payload)
-
-def safe_post_route(base, src, dst, **kw):
-    try:
-        return post_route(base, src, dst, **kw)
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else None
-        if code == 429:
-            try:
-                retry = int(e.response.json().get('retry_after', 3))
-            except Exception:
-                retry = 3
-            print(f"[agent] Cooldown active, waiting {retry}s")
-            time.sleep(retry)
-            return None
-        if code == 409:
-            print("[agent] No valid path currently")
-            time.sleep(2)
-            return None
-        print("[agent] Unexpected HTTP error:", e)
-        return None
-    except Exception as e:
-        print("[agent] Post failed:", e)
-        return None
-
-def index_ports(snapshot):
-    idx = defaultdict(dict)
-    for p in snapshot:
+def safe_get(url, retries=3, backoff=0.5):
+    last=None
+    for i in range(retries):
         try:
-            idx[int(p['dpid'])][int(p['port_no'])] = p
+            return jget(url)
+        except Exception as e:
+            last=e
+            time.sleep(backoff*(i+1))
+    raise last
+
+def get_hosts(base):
+    return safe_get(f"{base}/hosts")
+
+def get_paths(base, src, dst, k):
+    return safe_get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}")
+
+def get_ports(base):
+    # used to estimate a crude reward
+    for ep in ("/metrics/ports", "/ports"):
+        try:
+            return jget(base+ep)
         except Exception:
             pass
-    return idx
+    return []
 
-def aggregate(hops, idx):
-    agg = {'rx_bytes':0.0,'tx_bytes':0.0,'rx_pkts':0.0,'tx_pkts':0.0,
-           'rx_dropped':0.0,'tx_dropped':0.0,'rx_errors':0.0,'tx_errors':0.0}
-    for h in hops:
-        p = idx.get(int(h.get('dpid', -1)), {}).get(int(h.get('out_port', -1)))
-        if not p: continue
-        agg['rx_bytes'] += float(p.get('rx_bytes', 0))
-        agg['tx_bytes'] += float(p.get('tx_bytes', 0))
-        agg['rx_pkts']  += float(p.get('rx_pkts', 0))
-        agg['tx_pkts']  += float(p.get('tx_pkts', 0))
-        agg['rx_dropped'] += float(p.get('rx_dropped', 0))
-        agg['tx_dropped'] += float(p.get('tx_dropped', 0))
-        agg['rx_errors']  += float(p.get('rx_errors', 0))
-        agg['tx_errors']  += float(p.get('tx_errors', 0))
-    return agg
+def post_route(base, src, dst, path_id, k):
+    return jpost(f"{base}/actions/route", {
+        "src_mac": src, "dst_mac": dst, "path_id": path_id, "k": k
+    })
 
-def reward(prev, now, dt):
-    """Throughput minus error/drop penalty, normalized by bandwidth"""
-    if dt <= 0: dt = 1e-6
-    tx_bytes = max(0.0, now['tx_bytes'] - prev['tx_bytes'])
-    drop = max(0.0, (now['tx_dropped'] + now['rx_dropped']) - (prev['tx_dropped'] + prev['rx_dropped']))
-    err  = max(0.0, (now['tx_errors'] + now['rx_errors']) - (prev['tx_errors'] + prev['rx_errors']))
-    throughput_bps = 8.0 * tx_bytes / dt
-    loss_penalty = 5000.0 * ((drop + err) / dt)
-    norm = (throughput_bps / MAX_BW) - (loss_penalty / MAX_BW)
-    return max(-1.0, min(norm, 1.0))  # clamp reward
+def ports_to_map(payload):
+    # returns {(dpid,port_no) -> (rx_bytes, tx_bytes)}
+    m={}
+    if isinstance(payload, dict) and "ports" in payload:
+        payload = payload["ports"]
+    if isinstance(payload, dict):
+        for dpid, plist in payload.items():
+            for p in plist or []:
+                d=int(p.get("dpid", int(dpid)))
+                po=int(p.get("port_no", p.get("port", 0)))
+                m[(d,po)] = (int(p.get("rx_bytes",0)), int(p.get("tx_bytes",0)))
+    elif isinstance(payload, list):
+        for p in payload:
+            d=int(p.get("dpid",0))
+            po=int(p.get("port_no", p.get("port", 0)))
+            m[(d,po)] = (int(p.get("rx_bytes",0)), int(p.get("tx_bytes",0)))
+    return m
 
-def load_q():
-    if os.path.exists(SAVE_FILE):
-        try:
-            with open(SAVE_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_q(q):
-    try:
-        with open(SAVE_FILE, 'w') as f:
-            json.dump(q, f, indent=2)
-    except Exception as e:
-        print("[agent] Could not save q_values:", e)
-
-def pick_pair(base, k, wait=60):
-    t0 = time.time()
-    while True:
-        hosts = get_hosts(base)
-        if hosts and len(hosts) >= 2:
-            for i in range(len(hosts)):
-                for j in range(i+1, len(hosts)):
-                    s, d = hosts[i]['mac'], hosts[j]['mac']
-                    ps = get_paths(base, s, d, k)
-                    if ps and isinstance(ps, list):
-                        return s, d
-        if time.time() - t0 > wait:
-            return None, None
-        time.sleep(2)
-
-def choose(q, n):
-    best, val = 0, -999
-    for i in range(n):
-        v = q.get(str(i), 0.0)
-        if v > val: best, val = i, v
-    return best
+def path_hop_ports(path):
+    # convert path.hops [{"dpid":1,"out_port":2}, ...] → list of (dpid,out_port)
+    hops = path.get("hops") or []
+    return [(int(h.get("dpid",0)), int(h.get("out_port",0))) for h in hops]
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--controller', default='127.0.0.1')
-    ap.add_argument('--port', type=int, default=8080)
-    ap.add_argument('--k', type=int, default=2)
-    ap.add_argument('--epsilon', type=float, default=0.3)
-    ap.add_argument('--trials', type=int, default=300)
-    ap.add_argument('--measure-wait', type=float, default=3.0)
-    ap.add_argument('--wait-hosts', type=int, default=60)
+    ap.add_argument("--controller", default="http://127.0.0.1:8080/api/v1")
+    ap.add_argument("--epsilon", type=float, default=0.2)
+    ap.add_argument("--k", type=int, default=2)
+    ap.add_argument("--src", required=True, help="src MAC")
+    ap.add_argument("--dst", required=True, help="dst MAC")
+    ap.add_argument("--duration", type=int, default=120)
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--cooldown_ms", type=int, default=300)
     args = ap.parse_args()
 
-    base = api_base(args.controller, args.port)
-    q = load_q()
-    plays = defaultdict(int)
+    base = args.controller.rstrip("/")
+    hosts = get_hosts(base)
+    print(f"[agent] Controller={base} | src={args.src} dst={args.dst}", file=sys.stderr)
 
-    src, dst = pick_pair(base, args.k, args.wait_hosts)
-    if not src or not dst:
-        print("[agent] No valid host pair found")
-        return 2
-    print(f"[agent] Controller={base} | src={src} dst={dst}")
-
-    prev_ports = get_ports(base)
-    prev_idx = index_ports(prev_ports)
-    eps = args.epsilon
-
-    for t in range(args.trials):
-        paths = get_paths(base, src, dst, args.k)
-        if not paths:
-            print("[agent] paths not available; retrying...")
-            time.sleep(2)
+    # Q-table for K arms
+    q = [0.0]*args.k
+    plays = [0]*args.k
+    t0=time.time()
+    t=0
+    while time.time()-t0 < args.duration:
+        # fetch available paths
+        try:
+            paths = get_paths(base, args.src, args.dst, args.k)
+        except Exception as e:
+            print("[agent] paths not available; retrying...", file=sys.stderr)
+            time.sleep(1.0)
             continue
+        if not isinstance(paths, list) or len(paths)==0:
+            print("[agent] paths not available; retrying...", file=sys.stderr)
+            time.sleep(1.0); continue
 
-        if random.random() < eps:
-            choice = random.randrange(len(paths))
+        # epsilon-greedy
+        explore = (random.random() < args.epsilon)
+        if explore:
+            a = random.randrange(min(len(paths), args.k))
         else:
-            choice = choose(q, len(paths))
+            a = max(range(min(len(paths), args.k)), key=lambda i: q[i])
 
-        chosen = paths[choice]
-        hops = chosen.get('hops', [])
-        if len(hops) < 1:
-            time.sleep(1)
-            continue
+        # measure tx_bytes before action on chosen hop ports
+        ports_before = ports_to_map(get_ports(base))
+        chosen = paths[a]
+        hop_ports = path_hop_ports(chosen)
 
-        print(f"[t={t}] path_id={choice} dpids={chosen.get('dpids')} eps={eps:.3f}")
-        ports_before = get_ports(base)
-        idx_before = index_ports(ports_before)
-        agg_before = aggregate(hops, idx_before)
-        t0 = time.time()
+        # try to install route
+        try:
+            resp = post_route(base, args.src, args.dst, a, args.k)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # cooldown
+                retry_after = int(e.headers.get("Retry-After","0"))
+                wait = max(retry_after, args.cooldown_ms/1000.0)
+                print("[agent] POST failed: 429 Too Many Requests", file=sys.stderr)
+                print(f"[agent] Cooldown active, waiting {wait:.0f}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            else:
+                print(f"[agent] route POST error: {e}", file=sys.stderr)
+                time.sleep(0.5); continue
+        except Exception as e:
+            print(f"[agent] route POST error: {e}", file=sys.stderr)
+            time.sleep(0.5); continue
 
-        safe_post_route(base, src, dst, path_id=choice, k=args.k)
-        time.sleep(args.measure_wait)
+        # wait a small interval, then re-read to build a crude reward
+        time.sleep(args.interval)
+        ports_after = ports_to_map(get_ports(base))
 
-        ports_after = get_ports(base)
-        idx_after = index_ports(ports_after)
-        agg_after = aggregate(hops, idx_after)
-        t1 = time.time()
+        # reward = inverse of avg tx delta across hop out_ports
+        deltas=[]
+        for dpid, outp in hop_ports:
+            b = ports_before.get((dpid,outp), (0,0))[1]
+            a_tx = ports_after.get((dpid,outp), (0,0))[1]
+            deltas.append(max(0, a_tx - b))
+        avg_tx = mean(deltas) if deltas else 0.0
+        reward = 1.0 / (1.0 + avg_tx/1e6)  # scale a bit
 
-        r = reward(agg_before, agg_after, t1 - t0)
-        plays[str(choice)] += 1
-        q[str(choice)] = q.get(str(choice), 0.0) + (r - q.get(str(choice), 0.0)) / plays[str(choice)]
-        print(f"  reward={r:.3f} | q[{choice}]={q[str(choice)]:.3f} | plays={plays[str(choice)]}")
+        plays[a] += 1
+        q[a] += (reward - q[a]) / plays[a]
 
-        eps *= DECAY_RATE
-        eps = max(0.05, eps)
+        print(f"[t={t}] path_id={a} dpids={chosen.get('dpids')} eps={args.epsilon:0.3f}", file=sys.stderr)
+        print(f"  reward={reward:0.3f} | q[{a}]={q[a]:0.3f} | plays={plays[a]}", file=sys.stderr)
 
-        save_q(q)
-        time.sleep(1.5)
+        # slight epsilon decay
+        args.epsilon = max(0.05, args.epsilon * 0.99)
+        t += 1
 
-    print("[agent] Done.")
-    save_q(q)
+    # summary
+    print(json.dumps({"q": q, "plays": plays}))
     return 0
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
