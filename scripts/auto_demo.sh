@@ -193,8 +193,10 @@ run_rl() {
   say "  [ctrl] Starting controller OF:${OF_PORT} REST:${WSAPI_PORT}"
   WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
 
-  say "  [topo] Launching two-path demo for ${RL_DURATION}s"
-  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${RL_DURATION}" > /tmp/topo_rl.out 2>&1 & topo_pid=$!
+  # Launch topology with a buffer so it outlives path-wait + RL runtime
+  local topo_secs=$(( RL_DURATION + PATH_WAIT_SECS + 15 ))
+  say "  [topo] Launching two-path demo for ${topo_secs}s (buffered)"
+  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${topo_secs}" > /tmp/topo_rl.out 2>&1 & topo_pid=$!
 
   say "  [wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
   macs="$(wait_for_paths "${PATH_WAIT_SECS}")" || {
