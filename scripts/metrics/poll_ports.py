@@ -9,8 +9,9 @@ import argparse, csv, json, sys, time, urllib.request, urllib.error
 from datetime import datetime
 
 CANDIDATE_ENDPOINTS = [
-    "/api/v1/metrics/ports",   # preferred if your controller exposes it
-    "/api/v1/ports",           # fallback shape
+    "/api/v1/metrics/ports",   # modern controllers
+    "/api/v1/stats/ports",     # our Ryu app exposes this one
+    "/api/v1/ports",           # legacy fallback
 ]
 
 def get_json(url, timeout=3.0):
