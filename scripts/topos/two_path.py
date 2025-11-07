@@ -1,64 +1,138 @@
 #!/usr/bin/env python3
-"""
-Two-path Mininet demo topology:
- h1 - s1 == s2 - h2
-       \- s3 -/
+# Enhanced Two-Path Mininet Topology for SDN RL Experiments
+# ----------------------------------------------------------
+# Features:
+# - Configurable delay, loss, and bandwidth for both paths
+# - Optional demo mode (ping flood)
+# - Clean start/stop handling and reproducible structure
+# - Outputs JSON summary for logging and reproducibility
 
-Fixes
-- Ensures deterministic host MACs 00:..:01 and 00:..:02
-- Keeps net up for --hold seconds so external scripts can reuse
-"""
-
-from mininet.topo import Topo
 from mininet.net import Mininet
-from mininet.node import OVSSwitch, Controller, RemoteController
+from mininet.node import RemoteController, OVSKernelSwitch
 from mininet.link import TCLink
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
+import argparse, time, json, os, sys
 
-import argparse
-import time
+def build_two_path(ctrl_ip, ctrl_port, args):
+    """Constructs two disjoint paths with configurable parameters"""
+    net = Mininet(controller=None, switch=OVSKernelSwitch, link=TCLink,
+                  autoSetMacs=True, autoStaticArp=True)
 
-class TwoPathTopo(Topo):
-    def build(self):
-        s1 = self.addSwitch('s1')
-        s2 = self.addSwitch('s2')
-        s3 = self.addSwitch('s3')
+    c0 = net.addController('c0', controller=RemoteController, ip=ctrl_ip, port=ctrl_port)
 
-        h1 = self.addHost('h1', mac='00:00:00:00:00:01')
-        h2 = self.addHost('h2', mac='00:00:00:00:00:02')
+    s1 = net.addSwitch('s1', protocols='OpenFlow13')
+    s2 = net.addSwitch('s2', protocols='OpenFlow13')
+    s3 = net.addSwitch('s3', protocols='OpenFlow13')
 
-        self.addLink(h1, s1)
-        self.addLink(h2, s2)
+    h1 = net.addHost('h1', ip='10.0.0.1/24')
+    h2 = net.addHost('h2', ip='10.0.0.2/24')
 
-        # Direct s1-s2
-        self.addLink(s1, s2)
-        # Alternate via s3
-        self.addLink(s1, s3)
-        self.addLink(s3, s2)
+    # Host links
+    net.addLink(h1, s1, bw=args.bw, delay='1ms', loss=0)
+    net.addLink(h2, s2, bw=args.bw, delay='1ms', loss=0)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ofp", type=int, default=6633)
-    ap.add_argument("--hold", type=int, default=300, help="seconds to keep net up")
-    args = ap.parse_args()
+    # Path A: direct s1 <-> s2
+    net.addLink(s1, s2, bw=args.bw, delay=args.delay_a, loss=args.loss_a)
 
-    topo = TwoPathTopo()
-    net = Mininet(topo=topo, switch=OVSSwitch, controller=None, link=TCLink, build=True, autoSetMacs=True)
-    rc = RemoteController("c0", ip="127.0.0.1", port=args.ofp)
-    net.addController(rc)
+    # Path B: via s3
+    net.addLink(s1, s3, bw=args.bw, delay=args.delay_b1, loss=args.loss_b1)
+    net.addLink(s3, s2, bw=args.bw, delay=args.delay_b2, loss=args.loss_b2)
+
+    info("\n*** Starting Mininet\n")
     net.start()
 
-    info("*** Sanity pings\n")
-    net.pingAll(timeout=1)
+    try:
+        info(f"*** Controller: {ctrl_ip}:{ctrl_port}\n")
+        info(f"*** Path A: s1-s2 | delay={args.delay_a} loss={args.loss_a}% bw={args.bw}Mbps\n")
+        info(f"*** Path B: s1-s3-s2 | delays={args.delay_b1}+{args.delay_b2}, losses={args.loss_b1}%+{args.loss_b2}%\n")
+        info(f"*** Hosts: {h1.IP()} <-> {h2.IP()}\n")
 
-    info("*** Holding topology for {}s\n".format(args.hold))
-    t_end = time.time() + args.hold
-    while time.time() < t_end:
-        time.sleep(1)
+        # Output config JSON (for reproducibility)
+        os.makedirs("docs/baseline", exist_ok=True)
+        config_path = f"docs/baseline/topo_config_{int(time.time())}.json"
+        cfg = {
+            "controller": f"{ctrl_ip}:{ctrl_port}",
+            "bw": args.bw,
+            "pathA": {"delay": args.delay_a, "loss": args.loss_a},
+            "pathB": {"delay1": args.delay_b1, "delay2": args.delay_b2,
+                      "loss1": args.loss_b1, "loss2": args.loss_b2}
+        }
+        with open(config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        info(f"*** Configuration saved: {config_path}\n")
 
-    net.stop()
+        # Demo mode (optional)
+        if args.demo:
+            info(f"*** Running demo ping flood for {args.demo_time}s\n")
+            h1.cmdPrint(f"ping -c {args.demo_time} {h2.IP()} &")
+            time.sleep(args.demo_time)
+            info("*** Demo completed.\n")
+
+        if args.no_cli:
+            info("*** Running pingAll (no CLI mode)\n")
+            result = net.pingAll()
+            info(f"*** PingAll result: {result}\n")
+
+            duration = max(0, getattr(args, "duration", 0))
+            keepalive = max(0.0, getattr(args, "keepalive_interval", 1.0))
+            if duration > 0:
+                info(f"*** Headless mode: keeping topology up for {duration}s\n")
+                deadline = time.time() + duration
+                while True:
+                    now = time.time()
+                    if now >= deadline:
+                        break
+                    if keepalive > 0:
+                        h1.cmd(f"ping -c 1 -W 1 {h2.IP()} >/dev/null 2>&1")
+                        sleep_time = min(keepalive, max(0.0, deadline - time.time()))
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+                    else:
+                        time.sleep(min(1.0, deadline - now))
+            return
+
+        CLI(net)
+    finally:
+        info("*** Stopping Mininet\n")
+        net.stop()
+
+def main():
+    setLogLevel("info")
+    ap = argparse.ArgumentParser(description="Two-path SDN topology for RL experiments")
+
+    ap.add_argument("--controller_ip", default="127.0.0.1", help="Controller IP")
+    ap.add_argument("--rest_port", type=int, default=8080, help="REST API port")
+    ap.add_argument("--bw", type=float, default=10.0, help="Bandwidth in Mbps")
+
+    # Path A parameters
+    ap.add_argument("--delay_a", default="10ms", help="Delay for path A (s1-s2)")
+    ap.add_argument("--loss_a", type=float, default=0.0, help="Loss rate for path A (%)")
+
+    # Path B parameters (s1-s3-s2)
+    ap.add_argument("--delay_b1", default="15ms", help="Delay from s1->s3")
+    ap.add_argument("--delay_b2", default="15ms", help="Delay from s3->s2")
+    ap.add_argument("--loss_b1", type=float, default=0.0, help="Loss from s1->s3 (%)")
+    ap.add_argument("--loss_b2", type=float, default=0.0, help="Loss from s3->s2 (%)")
+
+    ap.add_argument("--no_cli", action="store_true", help="Exit after running warmups (no interactive CLI)")
+    ap.add_argument("--demo", action="store_true", help="Run demo ping flood")
+    ap.add_argument("--demo_time", type=int, default=20, help="Seconds for demo")
+    ap.add_argument("--duration", type=int, default=0,
+                    help="Headless mode: keep topology active for this many seconds (0=exit immediately)")
+    ap.add_argument("--keepalive_interval", type=float, default=1.0,
+                    help="In headless mode, send keepalive pings every N seconds (0=disable)")
+
+    args = ap.parse_args()
+
+    try:
+        build_two_path(args.controller_ip, 6633, args)
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user.")
+        sys.exit(0)
+    except Exception as e:
+        print("[!] Error while building topology:", e)
+        sys.exit(1)
 
 if __name__ == "__main__":
-    setLogLevel("info")
     main()

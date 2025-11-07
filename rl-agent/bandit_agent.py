@@ -1,182 +1,171 @@
 #!/usr/bin/env python3
-"""
-Epsilon-greedy bandit agent for path selection.
+# scripts/agents/bandit_agent.py
+#
+# Minimal epsilon-greedy bandit that flips between k paths from the controller:
+#   GET  /api/v1/paths?src_mac=..&dst_mac=..&k=K
+#   POST /api/v1/actions/route {"src_mac","dst_mac","path_id","k"}
+# Reward proxy: inverse of average tx_bytes increase per hop over the sample window
+# (higher reward → lighter path). This is simplistic but works as a demo.
 
-Fixes vs. old version
-- Honors HTTP 429 Retry-After (header or JSON) with real sleep.
-- Does not advance t/decay epsilon on 429 (no-op step).
-- Fetches k-paths once and caches mapping path_id -> dpids.
-- Logs compact JSON of q-values and play counts at the end.
-- Safer reward function (uses deltas of drops/errors + throughput).
-"""
+import argparse, json, random, sys, time, urllib.request, urllib.error
+from statistics import mean
 
-import argparse
-import json
-import random
-import time
-from math import exp
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+def jget(url, timeout=3.0):
+    req = urllib.request.Request(url, headers={"Accept":"application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
 
-def http_get(url, timeout=3):
-    req = Request(url, method="GET")
-    with urlopen(req, timeout=timeout) as r:
-        return r.getcode(), r.read(), r.headers
+def jpost(url, payload, timeout=3.0):
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type":"application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
 
-def http_post(url, payload, timeout=3):
-    data = json.dumps(payload).encode("utf-8")
-    req = Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urlopen(req, timeout=timeout) as r:
-            return r.getcode(), r.read(), r.headers
-    except HTTPError as e:
-        return e.code, e.read(), getattr(e, "headers", {})
-    except URLError as e:
-        raise e
+def safe_get(url, retries=3, backoff=0.5):
+    last=None
+    for i in range(retries):
+        try:
+            return jget(url)
+        except Exception as e:
+            last=e
+            time.sleep(backoff*(i+1))
+    raise last
 
-def parse_retry_after(headers, body_bytes):
-    # Priority: HTTP header, then JSON field
-    if headers:
-        ra = headers.get("Retry-After")
-        if ra:
-            try:
-                return max(1, int(float(ra)))
-            except Exception:
-                pass
-    try:
-        b = json.loads(body_bytes.decode("utf-8"))
-        ra = b.get("retry_after")
-        if ra is not None:
-            return max(1, int(float(ra)))
-    except Exception:
-        pass
-    return 1
+def get_hosts(base):
+    return safe_get(f"{base}/hosts")
 
 def get_paths(base, src, dst, k):
-    code, body, _ = http_get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}")
-    if code != 200:
-        raise RuntimeError(f"paths GET failed: {code} {body[:120]}")
-    paths = json.loads(body.decode("utf-8"))
-    # Normalize to {pid: dpids}
-    out = {}
-    for p in paths:
-        out[p["path_id"]] = p["dpids"]
-    return out
+    return safe_get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}")
 
-def get_port_stats(base):
-    code, body, _ = http_get(f"{base}/stats/ports")
-    if code != 200:
-        return []
-    return json.loads(body.decode("utf-8"))
+def get_ports(base):
+    # used to estimate a crude reward
+    # try a few REST shapes relative to base (which already includes /api/v1)
+    for ep in ("stats/ports", "metrics/ports", "ports"):
+        url = f"{base.rstrip('/')}/{ep}"
+        try:
+            return jget(url)
+        except Exception:
+            pass
+    return []
 
-def reward_from_stats(prev, curr):
-    """Higher is better. Combines throughput and (negative) drops/errors."""
-    if prev is None or not prev or not curr:
-        return 1.0
-    # Build keyed dicts for deltas
-    pk = {(r["dpid"], r["port_no"]): r for r in prev}
-    ck = {(r["dpid"], r["port_no"]): r for r in curr}
-    d_tx_bytes = 0
-    d_drops = 0
-    d_err = 0
-    for k, c in ck.items():
-        p = pk.get(k)
-        if not p:
-            continue
-        d_tx_bytes += max(0, c["tx_bytes"] - p["tx_bytes"])
-        d_drops += max(0, (c["rx_dropped"] - p["rx_dropped"]) + (c["tx_dropped"] - p["tx_dropped"]))
-        d_err += max(0, (c["rx_errors"] - p["rx_errors"]) + (c["tx_errors"] - p["tx_errors"]))
-    # Normalize
-    th = 1.0 if d_tx_bytes <= 0 else 1.0
-    penalty = 0.0
-    if d_drops > 0 or d_err > 0:
-        penalty = min(0.25 + 0.25 * (d_drops + d_err) / 1000.0, 0.75)
-    return max(0.25, min(1.0, th - penalty))
+def post_route(base, src, dst, path_id, k):
+    return jpost(f"{base}/actions/route", {
+        "src_mac": src, "dst_mac": dst, "path_id": path_id, "k": k
+    })
+
+def ports_to_map(payload):
+    # returns {(dpid,port_no) -> (rx_bytes, tx_bytes)}
+    m={}
+    if isinstance(payload, dict) and "ports" in payload:
+        payload = payload["ports"]
+    if isinstance(payload, dict):
+        for dpid, plist in payload.items():
+            for p in plist or []:
+                d=int(p.get("dpid", int(dpid)))
+                po=int(p.get("port_no", p.get("port", 0)))
+                m[(d,po)] = (int(p.get("rx_bytes",0)), int(p.get("tx_bytes",0)))
+    elif isinstance(payload, list):
+        for p in payload:
+            d=int(p.get("dpid",0))
+            po=int(p.get("port_no", p.get("port", 0)))
+            m[(d,po)] = (int(p.get("rx_bytes",0)), int(p.get("tx_bytes",0)))
+    return m
+
+def path_hop_ports(path):
+    # convert path.hops [{"dpid":1,"out_port":2}, ...] → list of (dpid,out_port)
+    hops = path.get("hops") or []
+    return [(int(h.get("dpid",0)), int(h.get("out_port",0))) for h in hops]
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="http://127.0.0.1:8080/api/v1", help="REST base")
+    ap.add_argument("--controller", default="http://127.0.0.1:8080/api/v1")
+    ap.add_argument("--epsilon", type=float, default=0.2)
+    ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--src", required=True, help="src MAC")
     ap.add_argument("--dst", required=True, help="dst MAC")
-    ap.add_argument("--k", type=int, default=2, help="number of paths to consider")
-    ap.add_argument("--epsilon", type=float, default=0.2)
-    ap.add_argument("--steps", type=int, default=120)
-    ap.add_argument("--sleep", type=float, default=1.0, help="seconds between decisions")
+    ap.add_argument("--duration", type=int, default=120)
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--cooldown_ms", type=int, default=300)
     args = ap.parse_args()
 
-    base = args.base.rstrip("/")
-    print(f"[agent] Controller={base} | src={args.src} dst={args.dst}")
+    base = args.controller.rstrip("/")
+    hosts = get_hosts(base)
+    print(f"[agent] Controller={base} | src={args.src} dst={args.dst}", file=sys.stderr)
 
-    # Fetch available paths
-    pid_to_path = get_paths(base, args.src, args.dst, args.k)
-    if not pid_to_path:
-        raise SystemExit("No paths available from controller.")
-    pids = sorted(pid_to_path.keys())
+    # Q-table for K arms
+    q = [0.0]*args.k
+    plays = [0]*args.k
+    t0=time.time()
+    t=0
+    while time.time()-t0 < args.duration:
+        # fetch available paths
+        try:
+            paths = get_paths(base, args.src, args.dst, args.k)
+        except Exception as e:
+            print("[agent] paths not available; retrying...", file=sys.stderr)
+            time.sleep(1.0)
+            continue
+        if not isinstance(paths, list) or len(paths)==0:
+            print("[agent] paths not available; retrying...", file=sys.stderr)
+            time.sleep(1.0); continue
 
-    # Q/plays
-    q = {pid: 0.0 for pid in pids}
-    plays = {pid: 0 for pid in pids}
-
-    prev_stats = None
-    t = 0
-    eps = args.epsilon
-
-    while t < args.steps:
-        # Choose action
-        explore = random.random() < eps
+        # epsilon-greedy
+        explore = (random.random() < args.epsilon)
         if explore:
-            a = random.choice(pids)
+            a = random.randrange(min(len(paths), args.k))
         else:
-            # break ties by smallest pid for determinism
-            a = max(pids, key=lambda pid: (q[pid], -pid))
+            a = max(range(min(len(paths), args.k)), key=lambda i: q[i])
 
-        dpids = pid_to_path[a]
-        print(f"[t={t}] path_id={a} dpids={dpids} eps={eps:.3f}")
+        # measure tx_bytes before action on chosen hop ports
+        ports_before = ports_to_map(get_ports(base))
+        chosen = paths[a]
+        hop_ports = path_hop_ports(chosen)
 
-        # Try to apply route
-        payload = {"src_mac": args.src, "dst_mac": args.dst, "path_id": int(a), "k": len(pids)}
-        code, body, headers = http_post(f"{base}/actions/route", payload)
+        # try to install route
+        try:
+            resp = post_route(base, args.src, args.dst, a, args.k)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # cooldown
+                retry_after = int(e.headers.get("Retry-After","0"))
+                wait = max(retry_after, args.cooldown_ms/1000.0)
+                print("[agent] POST failed: 429 Too Many Requests", file=sys.stderr)
+                print(f"[agent] Cooldown active, waiting {wait:.0f}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            else:
+                print(f"[agent] route POST error: {e}", file=sys.stderr)
+                time.sleep(0.5); continue
+        except Exception as e:
+            print(f"[agent] route POST error: {e}", file=sys.stderr)
+            time.sleep(0.5); continue
 
-        if code == 429:
-            wait_s = parse_retry_after(headers, body)
-            print(f"[agent] POST failed: 429 Too Many Requests")
-            print(f"[agent] Cooldown active, sleeping {wait_s}s (honoring Retry-After)")
-            time.sleep(wait_s)
-            # Do NOT advance timestep or decay epsilon
-            # (also do not update reward/q)
-            continue
-        elif code != 200:
-            print(f"[agent] POST failed: {code} {body[:120]}")
-            time.sleep(max(1.0, args.sleep))
-            continue
+        # wait a small interval, then re-read to build a crude reward
+        time.sleep(args.interval)
+        ports_after = ports_to_map(get_ports(base))
 
-        # Small settle time
-        time.sleep(max(0.2, args.sleep * 0.2))
+        # reward = inverse of avg tx delta across hop out_ports
+        deltas=[]
+        for dpid, outp in hop_ports:
+            b = ports_before.get((dpid,outp), (0,0))[1]
+            a_tx = ports_after.get((dpid,outp), (0,0))[1]
+            deltas.append(max(0, a_tx - b))
+        avg_tx = mean(deltas) if deltas else 0.0
+        reward = 1.0 / (1.0 + avg_tx/1e6)  # scale a bit
 
-        # Measure reward
-        curr_stats = get_port_stats(base)
-        r = reward_from_stats(prev_stats, curr_stats)
-        prev_stats = curr_stats
-
-        # Incremental mean update
         plays[a] += 1
-        q[a] = q[a] + (r - q[a]) / plays[a]
+        q[a] += (reward - q[a]) / plays[a]
 
-        print(f"  reward={r:.3f} | q[{a}]={q[a]:.3f} | plays={plays[a]}")
+        print(f"[t={t}] path_id={a} dpids={chosen.get('dpids')} eps={args.epsilon:0.3f}", file=sys.stderr)
+        print(f"  reward={reward:0.3f} | q[{a}]={q[a]:0.3f} | plays={plays[a]}", file=sys.stderr)
 
-        # Advance
+        # slight epsilon decay
+        args.epsilon = max(0.05, args.epsilon * 0.99)
         t += 1
-        # Soft decay
-        eps = max(0.02, eps * 0.99)
 
-        # Sleep remainder
-        time.sleep(max(0.0, args.sleep - 0.2))
-
-    # Final line for scripts to parse
-    qlist = [q.get(pid, 0.0) for pid in pids]
-    plist = [plays.get(pid, 0) for pid in pids]
-    print(json.dumps({"q": qlist, "plays": plist}))
+    # summary
+    print(json.dumps({"q": q, "plays": plays}))
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
