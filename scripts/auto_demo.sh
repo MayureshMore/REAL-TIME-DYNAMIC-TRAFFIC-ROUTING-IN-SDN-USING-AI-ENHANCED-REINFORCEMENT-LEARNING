@@ -225,10 +225,9 @@ run_rl() {
   export SRC_MAC="${H1}" DST_MAC="${H2}" CTRL_HOST="${CTRL_HOST}" WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}"
   export REUSE_TOPOLOGY=1
 
-  # Run RL (capture logs)
-  OUT=$(
-    bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
-  )
+  # Run RL (stream logs to console while tee'ing to disk)
+  rm -f /tmp/rl.out /tmp/rl.err
+  bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
 
   # Prefer the path echoed by the runner; otherwise choose newest RL CSV
   RL_CSV="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
