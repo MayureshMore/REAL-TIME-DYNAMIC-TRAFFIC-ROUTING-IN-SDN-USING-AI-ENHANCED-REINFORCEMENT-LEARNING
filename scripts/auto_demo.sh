@@ -254,8 +254,13 @@ run_rl() {
     sleep 10
   done
 
-  # Let the short-lived topo finish quietly
-  [ -n "${topo_pid:-}" ] && wait "${topo_pid}" 2>/dev/null || true
+  # Stop the buffered demo topology to avoid long waits
+  if [ -n "${topo_pid:-}" ]; then
+    say "  [topo] Stopping demo topology"
+    kill "${topo_pid}" 2>/dev/null || true
+    sleep 1
+    kill -9 "${topo_pid}" 2>/dev/null || true
+  fi
 }
 
 
