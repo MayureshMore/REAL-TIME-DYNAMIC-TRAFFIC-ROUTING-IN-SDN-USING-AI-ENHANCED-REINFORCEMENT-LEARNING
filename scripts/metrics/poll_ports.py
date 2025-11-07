@@ -9,9 +9,9 @@ import argparse, csv, json, sys, time, urllib.request, urllib.error
 from datetime import datetime
 
 CANDIDATE_ENDPOINTS = [
-    "/api/v1/metrics/ports",   # modern controllers
-    "/api/v1/stats/ports",     # our Ryu app exposes this one
-    "/api/v1/ports",           # legacy fallback
+    "metrics/ports",   # modern controllers expose metrics endpoint
+    "stats/ports",     # Ryu app in this repo
+    "ports",           # legacy fallback
 ]
 
 def get_json(url, timeout=3.0):
@@ -103,8 +103,9 @@ def main():
             ts = now
             data = None
             last_err = None
+            base = args.controller.rstrip("/")
             for ep in CANDIDATE_ENDPOINTS:
-                url = args.controller.rstrip("/") + ep
+                url = f"{base}/{ep.lstrip('/')}"
                 try:
                     data = get_json(url)
                     break
