@@ -75,7 +75,7 @@ start_controller() {
 sanity_topo() {
   step "2) Sanity topology up for ~${SANITY_SECS}s"
   say "  Waiting for graph (hosts & k-paths)..."
-  python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${SANITY_SECS}" > /tmp/topo_sanity.out 2>&1 &
+  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${SANITY_SECS}" > /tmp/topo_sanity.out 2>&1 &
 
   end=$(( $(date +%s) + SANITY_SECS ))
   printed=0

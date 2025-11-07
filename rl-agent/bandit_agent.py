@@ -39,9 +39,11 @@ def get_paths(base, src, dst, k):
 
 def get_ports(base):
     # used to estimate a crude reward
-    for ep in ("/metrics/ports", "/ports"):
+    # try a few REST shapes relative to base (which already includes /api/v1)
+    for ep in ("stats/ports", "metrics/ports", "ports"):
+        url = f"{base.rstrip('/')}/{ep}"
         try:
-            return jget(base+ep)
+            return jget(url)
         except Exception:
             pass
     return []
