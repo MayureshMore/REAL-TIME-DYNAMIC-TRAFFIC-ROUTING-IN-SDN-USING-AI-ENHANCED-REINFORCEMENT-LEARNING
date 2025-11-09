@@ -55,15 +55,18 @@ patch_once() {
   fi
 }
 
-clean_start() {
-  step "0) Clean start"
-  sudo mn -c >/dev/null 2>&1 || true
-  sudo pkill -9 -f 'mininet($|:)' >/dev/null 2>&1 || true
-  # Kill any stale tails from previous runs that could keep terminals busy
+kill_stray_tails() {
   pkill -f "tail -n \+1 -f /tmp/topo.out /tmp/logger.out /tmp/agent.out" >/dev/null 2>&1 || true
   pkill -f "tail -f /tmp/agent.out" >/dev/null 2>&1 || true
   pkill -f "tail -f /tmp/logger.out" >/dev/null 2>&1 || true
   pkill -f "tail -f /tmp/topo.out"   >/dev/null 2>&1 || true
+}
+
+clean_start() {
+  step "0) Clean start"
+  sudo mn -c >/dev/null 2>&1 || true
+  sudo pkill -9 -f 'mininet($|:)' >/dev/null 2>&1 || true
+  kill_stray_tails
   rm -f /tmp/vconn* /tmp/vlogs* /tmp/*.out /tmp/*.log 2>/dev/null || true
   rm -f ~/.ssh/mn/* 2>/dev/null || true
   say "  Cleanup complete."
@@ -136,11 +139,10 @@ run_baseline() {
   done
 }
 
-# robust H1/H2/path discovery with validation (used by sanity only)
 wait_for_paths() {
   local timeout_sec="${1:-$PATH_WAIT_SECS}"
   local deadline=$(( $(date +%s) + timeout_sec ))
-  local hosts_json macs_line H1 H2 attempts=0
+  local hosts_json macs_line attempts=0
 
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     attempts=$((attempts+1))
@@ -171,45 +173,83 @@ run_rl() {
   step "4) RL run for ${RL_DURATION}s (epsilon=${EPSILON}, k=${K})"
   patch_once
 
-  # Let the RL runner manage the controller/topology lifecycle itself.
-  # This avoids duplicate launches and any blocking tails.
+  say "  [prep] sudo mn -c"
+  sudo mn -c >/dev/null 2>&1 || true
+
+  say "  [ctrl] Starting controller OF:${OF_PORT} REST:${WSAPI_PORT}"
+  WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
+
+  # Launch topology long enough to cover wait + RL
+  local topo_secs=$(( RL_DURATION + PATH_WAIT_SECS + 15 ))
+  say "  [topo] Launching two-path demo for ${topo_secs}s (buffered)"
+  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${topo_secs}" > /tmp/topo_rl.out 2>&1 & local topo_pid=$!
+
+  say "  [wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
+  macs="$(wait_for_paths "${PATH_WAIT_SECS}")" || {
+    say "  [x] timed out waiting for hosts/paths; check controller logs"
+    [ -f /tmp/topo_rl.out ] && { say "  [debug] tail /tmp/topo_rl.out"; tail -n 60 /tmp/topo_rl.out | indent; }
+    [ -f "${HOME}/ryu-controller.log" ] && { say "  [debug] tail ~/ryu-controller.log"; tail -n 60 "${HOME}/ryu-controller.log" | indent; }
+    [ -n "${topo_pid:-}" ] && kill "${topo_pid}" 2>/dev/null || true
+    exit 1
+  }
+
+  # shellcheck disable=SC2086
+  read -r H1 H2 <<<"${macs}"
+  say "  [wait] Paths available for ${H1} -> ${H2}"
+
+  # Warm k-path cache both directions (makes RL start faster)
+  curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null || true
+  curl -sf "${API_BASE}/paths?src_mac=${H2}&dst_mac=${H1}&k=${K}" >/dev/null || true
+
+  # Environment for the RL runner — REUSE the running topo; provide SRC/DST
   export DURATION="${RL_DURATION}" EPSILON="${EPSILON}" K="${K}"
+  export SRC_MAC="${H1}" DST_MAC="${H2}"
   export CTRL_HOST="${CTRL_HOST}" WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}"
+  export REUSE_TOPOLOGY=1
   export PATH_WAIT_SECS="${PATH_WAIT_SECS}"
-  export REUSE_TOPOLOGY=0
 
   rm -f /tmp/rl.out /tmp/rl.err
-  RL_CSV_PATH="$(bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out | tail -n 1)"
+  # line-buffer to avoid stdout clumping
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
+  else
+    bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
+  fi
   RL_STATUS=$?
 
-  # Ensure no background tails survive (older runner versions)
-  pkill -f "tail -n \+1 -f /tmp/topo.out /tmp/logger.out /tmp/agent.out" >/dev/null 2>&1 || true
-  pkill -f "tail -f /tmp/agent.out" >/dev/null 2>&1 || true
-  pkill -f "tail -f /tmp/logger.out" >/dev/null 2>&1 || true
-  pkill -f "tail -f /tmp/topo.out"   >/dev/null 2>&1 || true
+  # Try to parse the RL CSV path from output; fallback to newest
+  RL_CSV="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
+  if [ -z "${RL_CSV}" ]; then
+    RL_CSV="$(ls -1t "${CSV_DIR}"/ports_rl_*.csv 2>/dev/null | head -n1 || true)"
+  fi
+
+  # Always stop tails the runner/topo might have spawned
+  kill_stray_tails
+
+  # Stop buffered demo topology now that RL finished
+  if [ -n "${topo_pid:-}" ]; then
+    say "  [topo] Stopping demo topology"
+    kill "${topo_pid}" 2>/dev/null || true
+    sleep 1
+    kill -9 "${topo_pid}" 2>/dev/null || true
+  fi
 
   if [ $RL_STATUS -ne 0 ]; then
     say "  [x] RL run failed; see /tmp/rl.err"
     exit $RL_STATUS
   fi
 
-  # Fallback if the runner didn't echo the CSV as last line
-  if [ ! -f "${RL_CSV_PATH:-}" ]; then
-    RL_CSV_PATH="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
-    [ -z "${RL_CSV_PATH}" ] && RL_CSV_PATH="$(ls -1t "${CSV_DIR}"/ports_rl_*.csv 2>/dev/null | head -n1 || true)"
-  fi
-
-  if [ -n "${RL_CSV_PATH}" ] && [ -f "${RL_CSV_PATH}" ]; then
-    say "  RL CSV: ${RL_CSV_PATH}"
+  if [ -n "${RL_CSV}" ] && [ -f "${RL_CSV}" ]; then
+    say "  RL CSV: ${RL_CSV}"
   else
     say "  [!] RL CSV not found. Check /tmp/rl.out and /tmp/rl.err"
   fi
 
   say
-  say "  Live peek: ${RL_CSV_PATH:-<unknown>} (every 10s for 60s)"
+  say "  Live peek: ${RL_CSV:-<unknown>} (every 10s for 60s)"
   for _ in {1..6}; do
-    if [ -n "${RL_CSV_PATH}" ] && [ -f "${RL_CSV_PATH}" ]; then
-      tail -n 12 "${RL_CSV_PATH}" | sed 's/[[:space:]]\+$//' | indent
+    if [ -n "${RL_CSV}" ] && [ -f "${RL_CSV}" ]; then
+      tail -n 12 "${RL_CSV}" | sed 's/[[:space:]]\+$//' | indent
     else
       say "  (waiting for first samples...)"
     fi
