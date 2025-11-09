@@ -35,9 +35,7 @@ indent() { sed 's/^/  /'; }
 say()    { printf "%s\n" "$*"; }
 step()   { printf "\n==> %s\n" "$*"; }
 
-need() {
-  command -v "$1" >/dev/null 2>&1 || { say "[x] missing dependency: $1"; exit 1; }
-}
+need() { command -v "$1" >/dev/null 2>&1 || { say "[x] missing dependency: $1"; exit 1; }; }
 
 need curl
 need jq
@@ -61,6 +59,11 @@ clean_start() {
   step "0) Clean start"
   sudo mn -c >/dev/null 2>&1 || true
   sudo pkill -9 -f 'mininet($|:)' >/dev/null 2>&1 || true
+  # Kill any stale tails from previous runs that could keep terminals busy
+  pkill -f "tail -n \+1 -f /tmp/topo.out /tmp/logger.out /tmp/agent.out" >/dev/null 2>&1 || true
+  pkill -f "tail -f /tmp/agent.out" >/dev/null 2>&1 || true
+  pkill -f "tail -f /tmp/logger.out" >/dev/null 2>&1 || true
+  pkill -f "tail -f /tmp/topo.out"   >/dev/null 2>&1 || true
   rm -f /tmp/vconn* /tmp/vlogs* /tmp/*.out /tmp/*.log 2>/dev/null || true
   rm -f ~/.ssh/mn/* 2>/dev/null || true
   say "  Cleanup complete."
@@ -96,7 +99,6 @@ sanity_topo() {
       H2="$(jq -r '.[1].mac // empty' <<<"${hosts}")"
       if [[ "${H1}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ && "${H2}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
         paths="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=2" | jq -c '.' 2>/dev/null || echo '[]')"
-        # accept either array of objects with dpids/hops, or any non-empty array
         if [ "$(jq -r 'type=="array" and length>0' <<<"${paths}")" = "true" ]; then
           say "  paths: ${paths}"
           say "  Graph healthy: ≥2 hosts and ≥1 path between ${H1} → ${H2}"
@@ -134,21 +136,17 @@ run_baseline() {
   done
 }
 
-# robust H1/H2/path discovery with validation
+# robust H1/H2/path discovery with validation (used by sanity only)
 wait_for_paths() {
   local timeout_sec="${1:-$PATH_WAIT_SECS}"
   local deadline=$(( $(date +%s) + timeout_sec ))
-
-  local hosts_json macs_line H1 H2 paths_ok="false" attempts=0
+  local hosts_json macs_line H1 H2 attempts=0
 
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     attempts=$((attempts+1))
-    # Pull hosts; require at least two valid MAC strings
     hosts_json="$(curl -sf "${API_BASE}/hosts" 2>/dev/null || echo '[]')"
-
     macs_line="$(
       jq -r '
-        # collect all string MACs that match AA:BB:CC:DD:EE:FF
         [ .[] | .mac? | strings
           | select(test("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$"))
         ]
@@ -156,21 +154,9 @@ wait_for_paths() {
         | "\(. [0]) \(. [1])"
       ' <<<"${hosts_json}" 2>/dev/null || true
     )"
-
     if [ -n "${macs_line}" ]; then
-      # shellcheck disable=SC2086
-      read -r H1 H2 <<<"${macs_line}"
-
-      # Warm both directions to populate k-path cache
-      curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null || true
-      curl -sf "${API_BASE}/paths?src_mac=${H2}&dst_mac=${H1}&k=${K}" >/dev/null || true
-      sleep 1
-
-      # Verify paths exist from H1->H2
-      if curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
-        printf "%s %s\n" "${H1}" "${H2}"
-        return 0
-      fi
+      printf "%s\n" "${macs_line}"
+      return 0
     else
       if (( attempts % 10 == 0 )); then
         say "  [wait] Hosts not ready yet (attempt ${attempts}); latest payload: ${hosts_json}"
@@ -178,7 +164,6 @@ wait_for_paths() {
     fi
     sleep 1
   done
-
   return 1
 }
 
@@ -186,80 +171,50 @@ run_rl() {
   step "4) RL run for ${RL_DURATION}s (epsilon=${EPSILON}, k=${K})"
   patch_once
 
-  say "  [prep] sudo mn -c"
-  sudo mn -c >/dev/null 2>&1 || true
-
-  say "  [ctrl] Starting controller OF:${OF_PORT} REST:${WSAPI_PORT}"
-  WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
-
-  # Launch topology with a buffer so it outlives path-wait + RL runtime
-  local topo_secs=$(( RL_DURATION + PATH_WAIT_SECS + 15 ))
-  say "  [topo] Launching two-path demo for ${topo_secs}s (buffered)"
-  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${topo_secs}" > /tmp/topo_rl.out 2>&1 & topo_pid=$!
-
-  say "  [wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
-  macs="$(wait_for_paths "${PATH_WAIT_SECS}")" || {
-    say "  [x] timed out waiting for hosts/paths; check controller logs"
-    if [ -f /tmp/topo_rl.out ]; then
-      say "  [debug] tail /tmp/topo_rl.out"
-      tail -n 40 /tmp/topo_rl.out | indent
-    fi
-    if [ -f "${HOME}/ryu-controller.log" ]; then
-      say "  [debug] tail ~/ryu-controller.log"
-      tail -n 40 "${HOME}/ryu-controller.log" | indent
-    fi
-    [ -n "${topo_pid:-}" ] && kill "${topo_pid}" 2>/dev/null || true
-    exit 1
-  }
-
-  # shellcheck disable=SC2086
-  read -r H1 H2 <<<"${macs}"
-  if [ -z "${H1}" ] || [ -z "${H2}" ]; then
-    say "  [x] internal error: empty H1/H2 after path wait"
-    [ -n "${topo_pid:-}" ] && kill "${topo_pid}" 2>/dev/null || true
-    exit 1
-  fi
-  say "  [wait] Paths available for ${H1} -> ${H2}"
-
-  # Export MACs so the RL runner/agent use exactly these endpoints
+  # Let the RL runner manage the controller/topology lifecycle itself.
+  # This avoids duplicate launches and any blocking tails.
   export DURATION="${RL_DURATION}" EPSILON="${EPSILON}" K="${K}"
-  export SRC_MAC="${H1}" DST_MAC="${H2}" CTRL_HOST="${CTRL_HOST}" WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}"
-  export REUSE_TOPOLOGY=1
+  export CTRL_HOST="${CTRL_HOST}" WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}"
+  export PATH_WAIT_SECS="${PATH_WAIT_SECS}"
+  export REUSE_TOPOLOGY=0
 
-  # Run RL (stream logs to console while tee'ing to disk)
   rm -f /tmp/rl.out /tmp/rl.err
-  bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
+  RL_CSV_PATH="$(bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out | tail -n 1)"
+  RL_STATUS=$?
 
-  # Prefer the path echoed by the runner; otherwise choose newest RL CSV
-  RL_CSV="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
-  if [ -z "${RL_CSV}" ]; then
-    RL_CSV="$(ls -1t "${CSV_DIR}"/ports_rl_*.csv 2>/dev/null | head -n1 || true)"
+  # Ensure no background tails survive (older runner versions)
+  pkill -f "tail -n \+1 -f /tmp/topo.out /tmp/logger.out /tmp/agent.out" >/dev/null 2>&1 || true
+  pkill -f "tail -f /tmp/agent.out" >/dev/null 2>&1 || true
+  pkill -f "tail -f /tmp/logger.out" >/dev/null 2>&1 || true
+  pkill -f "tail -f /tmp/topo.out"   >/dev/null 2>&1 || true
+
+  if [ $RL_STATUS -ne 0 ]; then
+    say "  [x] RL run failed; see /tmp/rl.err"
+    exit $RL_STATUS
   fi
 
-  if [ -n "${RL_CSV}" ] && [ -f "${RL_CSV}" ]; then
-    say "  RL CSV: ${RL_CSV}"
+  # Fallback if the runner didn't echo the CSV as last line
+  if [ ! -f "${RL_CSV_PATH:-}" ]; then
+    RL_CSV_PATH="$(grep -Eo 'docs/baseline/ports_rl_[0-9_]+\.csv' /tmp/rl.out | tail -n1 || true)"
+    [ -z "${RL_CSV_PATH}" ] && RL_CSV_PATH="$(ls -1t "${CSV_DIR}"/ports_rl_*.csv 2>/dev/null | head -n1 || true)"
+  fi
+
+  if [ -n "${RL_CSV_PATH}" ] && [ -f "${RL_CSV_PATH}" ]; then
+    say "  RL CSV: ${RL_CSV_PATH}"
   else
-    say "  [!] RL CSV not found. See /tmp/rl.out and /tmp/rl.err"
+    say "  [!] RL CSV not found. Check /tmp/rl.out and /tmp/rl.err"
   fi
 
   say
-  say "  Live peek: ${RL_CSV:-<unknown>} (every 10s for 60s)"
+  say "  Live peek: ${RL_CSV_PATH:-<unknown>} (every 10s for 60s)"
   for _ in {1..6}; do
-    if [ -n "${RL_CSV}" ] && [ -f "${RL_CSV}" ]; then
-      tail -n 12 "${RL_CSV}" | sed 's/[[:space:]]\+$//' | indent
+    if [ -n "${RL_CSV_PATH}" ] && [ -f "${RL_CSV_PATH}" ]; then
+      tail -n 12 "${RL_CSV_PATH}" | sed 's/[[:space:]]\+$//' | indent
     else
       say "  (waiting for first samples...)"
     fi
     sleep 10
   done
-
-  # Stop the buffered demo topology to avoid long waits
-  if [ -n "${topo_pid:-}" ]; then
-    say "  [topo] Stopping demo topology"
-    kill "${topo_pid}" 2>/dev/null || true
-    sleep 1
-    kill -9 "${topo_pid}" 2>/dev/null || true
-  fi
 }
 
 plot_results() {
