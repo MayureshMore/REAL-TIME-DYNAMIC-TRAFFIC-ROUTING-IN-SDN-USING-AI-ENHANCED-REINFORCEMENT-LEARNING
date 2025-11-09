@@ -15,7 +15,7 @@ K="${K:-2}"
 PATH_WAIT_SECS="${PATH_WAIT_SECS:-180}"
 
 # Extra breathing room to detect hang beyond reported "RL run complete"
-RL_WATCHDOG_PAD="${RL_WATCHDOG_PAD:-45}"   # seconds
+RL_WATCHDOG_PAD="${RL_WATCHDOG_PAD:-45}"
 
 ENSURE="${REPO}/scripts/ensure_controller.sh"
 TOPO="${REPO}/scripts/topos/two_path.py"
@@ -41,11 +41,10 @@ kill_stray_tails() {
   pkill -f "tail -f /tmp/agent.out"    >/dev/null 2>&1 || true
   pkill -f "tail -f /tmp/logger.out"   >/dev/null 2>&1 || true
   pkill -f "tail -f /tmp/topo.out"     >/dev/null 2>&1 || true
-  pkill -f "tail -n \+1 -f "           >/dev/null 2>&1 || true
+  pkill -f "tail -n \\+1 -f "          >/dev/null 2>&1 || true
 }
 
 kill_stragglers() {
-  # Anything likely to keep the demo alive
   pkill -f "${TOPO}"                   >/dev/null 2>&1 || true
   pkill -f "bandit_agent.py"           >/dev/null 2>&1 || true
   pkill -f "logger.py"                 >/dev/null 2>&1 || true
@@ -86,9 +85,8 @@ patch_once() {
 
   # Neuter any 'tail -f' that would hold the TTY open
   if grep -q 'tail[[:space:]]\+-n[[:space:]]\+\\\?+1[[:space:]]\+-f' "${RUN_RL}"; then
-    # Replace "tail -n +1 -f ..." with a one-time "tail -n 200 ..." (non-follow)
     sed -i 's/tail[[:space:]]\+-n[[:space:]]\+\\\?+1[[:space:]]\+-f/tail -n 200/g' "${RUN_RL}"
-    say "[patch] Replaced tail -f with non-following tail in run_with_rl.sh"
+    say "[patch] Replaced tail -f (+1) with non-following tail in run_with_rl.sh"
   fi
   if grep -q 'tail[[:space:]]\+-f' "${RUN_RL}"; then
     sed -i 's/tail[[:space:]]\+-f/tail -n 200/g' "${RUN_RL}"
@@ -216,7 +214,8 @@ run_rl() {
 
   local topo_secs=$(( RL_DURATION + PATH_WAIT_SECS + 15 ))
   say "  [topo] Launching two-path demo for ${topo_secs}s (buffered)"
-  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${topo_secs}" > /tmp/topo_rl.out 2>&1 & local topo_pid=$!
+  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${topo_secs}" > /tmp/topo_rl.out 2>&1 &
+  local topo_pid=$!
 
   say "  [wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
   macs="$(wait_for_paths "${PATH_WAIT_SECS}")" || {
@@ -248,7 +247,6 @@ run_rl() {
   RL_STATUS=$?
   set -e
 
-  # 124 == timeout; anything else nonzero means failure
   if [ ${RL_STATUS} -ne 0 ]; then
     if [ ${RL_STATUS} -eq 124 ]; then
       say "  [x] RL step exceeded ${watch_secs}s (likely hang after \"q\")."
@@ -291,10 +289,10 @@ run_rl() {
     sleep 10
   done
 
-  # If we hit the watchdog, fail the script so you notice in CI, but only after we showed logs
+  # If we hit the watchdog, fail after logs so the hang is obvious
   if [ ${RL_STATUS} -ne 0 ]; then
     exit ${RL_STATUS}
-  endfi
+  fi
 }
 
 plot_results() {
