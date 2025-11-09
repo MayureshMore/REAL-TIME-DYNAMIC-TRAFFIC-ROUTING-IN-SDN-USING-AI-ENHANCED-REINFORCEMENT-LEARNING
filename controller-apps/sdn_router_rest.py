@@ -1,183 +1,393 @@
 #!/usr/bin/env python3
-# scripts/agents/bandit_agent.py
-#
-# Minimal epsilon-greedy bandit that flips between k paths from the controller:
-#   GET  /api/v1/paths?src_mac=..&dst_mac=..&k=K
-#   POST /api/v1/actions/route {"src_mac","dst_mac","path_id","k"}
-# Reward proxy: inverse of average tx_bytes increase per hop over the sample window
-# (higher reward → lighter path). This is simplistic but works as a demo.
+# Unified SDN controller app: L2 learning + topology + routing + REST + stats
 
-import argparse, json, random, sys, time, urllib.request, urllib.error
-from statistics import mean
+from collections import defaultdict
+import hashlib, json, time, networkx as nx
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib.packet import packet, ethernet, ether_types
+from ryu.lib import hub
+from ryu.topology import event as topo_event
+from ryu.app.wsgi import WSGIApplication, ControllerBase, route
+from webob import Response
+from jsonschema import validate, ValidationError
 
-def jget(url, timeout=3.0):
-    req = urllib.request.Request(url, headers={"Accept":"application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+API_INSTANCE = 'sdn_router_api'
 
-def jpost(url, payload, timeout=3.0):
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={"Content-Type":"application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+def j(obj, status=200, headers=None):
+    resp = Response(content_type='application/json',
+                    body=json.dumps(obj, default=str).encode('utf-8'),
+                    status=status)
+    if headers:
+        for k, v in headers.items():
+            resp.headers[k] = v
+    return resp
 
-def safe_get(url, retries=3, backoff=0.5):
-    last=None
-    for i in range(retries):
+ROUTE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "src_mac": {"type": "string"},
+        "dst_mac": {"type": "string"},
+        "k": {"type": "integer", "minimum": 1},
+        "path_id": {"type": "integer", "minimum": 0},
+        "path": {"type": "array", "items": {"type": "integer"}}
+    },
+    "required": ["src_mac", "dst_mac"],
+    "anyOf": [{"required": ["path_id"]}, {"required": ["path"]}]
+}
+
+class SDNRouterREST(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'wsgi': WSGIApplication}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mac_to_port = defaultdict(dict)
+        self.hosts = {}
+        self.datapaths = {}
+        self.G = nx.DiGraph()
+        self.core_ports = defaultdict(set)
+        self.k_paths_cached = {}
+        self.routes = {}
+        self.last_action_ts = {}
+        self.route_cooldown = 5.0
+
+        # Stats
+        self.port_stats = []
+        self.port_prev = {}
+        self.port_rates = []
+        self.flow_stats = []
+        self.last_stats_ts = 0.0
+        self.cache_ttl = 2.0
+
+        # Threads
+        self.monitor_interval = 2
+        self.monitor_thread = hub.spawn(self._monitor)
+        self.sweep_thread = hub.spawn(self._sweep_core_leaks)
+
+        wsgi = kwargs['wsgi']
+        wsgi.register(RESTController, {API_INSTANCE: self})
+
+    # -------------------- OpenFlow base --------------------
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        dp = ev.msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=0, match=match, instructions=inst))
+        self.logger.info("Installed table-miss on %s", dp.id)
+
+    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def state_change_handler(self, ev):
+        dp = ev.datapath
+        if ev.state == MAIN_DISPATCHER:
+            self.datapaths[dp.id] = dp
+            self.G.add_node(dp.id)
+        elif ev.state == DEAD_DISPATCHER:
+            self.datapaths.pop(dp.id, None)
+            if self.G.has_node(dp.id):
+                self.G.remove_node(dp.id)
+            self.core_ports.pop(dp.id, None)
+            self.k_paths_cached = {k:v for k,v in self.k_paths_cached.items()
+                                   if dp.id not in (k[0], k[1])}
+
+    # -------------------- L2 Learning --------------------
+    def _purge_hosts_on_port(self, dpid, port_no):
+        bad = [m for m,h in self.hosts.items() if h['dpid']==dpid and h['port']==port_no]
+        for mac in bad: self.hosts.pop(mac, None)
+        if dpid in self.mac_to_port:
+            for mac,p in list(self.mac_to_port[dpid].items()):
+                if p==port_no: self.mac_to_port[dpid].pop(mac)
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        msg, dp = ev.msg, ev.msg.datapath
+        parser, ofp = dp.ofproto_parser, dp.ofproto
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP: return
+        in_port = msg.match['in_port']
+        src, dst = eth.src, eth.dst
+
+        if in_port not in self.core_ports.get(dp.id,set()):
+            self.mac_to_port[dp.id][src] = in_port
+            self.hosts[src] = {'dpid': dp.id, 'port': in_port}
+
+        out_port = self.mac_to_port[dp.id].get(dst, ofp.OFPP_FLOOD)
+        actions = [parser.OFPActionOutput(out_port)]
+        if out_port != ofp.OFPP_FLOOD:
+            match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_dst=dst)
+            inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+            dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=1, match=match, instructions=inst))
+        dp.send_msg(parser.OFPPacketOut(datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                                        in_port=in_port, actions=actions, data=msg.data))
+
+    # -------------------- Topology & Links --------------------
+    @set_ev_cls(topo_event.EventLinkAdd)
+    def link_add(self, ev):
+        u,v = ev.link.src.dpid, ev.link.dst.dpid
+        u_p,v_p = ev.link.src.port_no, ev.link.dst.port_no
+        self.G.add_edge(u,v,u_port=u_p,v_port=v_p)
+        self.G.add_edge(v,u,u_port=v_p,v_port=u_p)
+        self.core_ports[u].add(u_p); self.core_ports[v].add(v_p)
+        self._purge_hosts_on_port(u,u_p); self._purge_hosts_on_port(v,v_p)
+        self.k_paths_cached.clear()
+        self.logger.info("Link added %s:%s <-> %s:%s",u,u_p,v,v_p)
+
+    @set_ev_cls(topo_event.EventLinkDelete)
+    def link_del(self, ev):
+        u,v = ev.link.src.dpid, ev.link.dst.dpid
+        u_p,v_p = ev.link.src.port_no, ev.link.dst.port_no
+        if self.G.has_edge(u,v): self.G.remove_edge(u,v)
+        if self.G.has_edge(v,u): self.G.remove_edge(v,u)
+        self.core_ports[u].discard(u_p); self.core_ports[v].discard(v_p)
+        self.k_paths_cached.clear()
+        self.logger.info("Link deleted %s:%s <-> %s:%s",u,u_p,v,v_p)
+
+    def _sweep_core_leaks(self):
+        while True:
+            try:
+                for dpid,ports in self.core_ports.items():
+                    for p in list(ports):
+                        self._purge_hosts_on_port(dpid,p)
+            except Exception as e:
+                self.logger.warning("sweep error: %s",e)
+            hub.sleep(2)
+
+    # -------------------- Stats --------------------
+    def _monitor(self):
+        while True:
+            try:
+                for dp in list(self.datapaths.values()):
+                    p=dp.ofproto_parser
+                    dp.send_msg(p.OFPPortStatsRequest(dp,0,dp.ofproto.OFPP_ANY))
+                    dp.send_msg(p.OFPFlowStatsRequest(dp))
+            except Exception as e:
+                self.logger.warning("monitor error: %s",e)
+            hub.sleep(self.monitor_interval)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def port_stats_reply(self, ev):
+        now=time.time(); stats=[]; rates=[]
+        for s in ev.msg.body:
+            rec={'timestamp':now,'dpid':ev.msg.datapath.id,'port_no':s.port_no,
+                 'rx_bytes':s.rx_bytes,'tx_bytes':s.tx_bytes,
+                 'rx_pkts':s.rx_packets,'tx_pkts':s.tx_packets,
+                 'rx_dropped':s.rx_dropped,'tx_dropped':s.tx_dropped,
+                 'rx_errors':s.rx_errors,'tx_errors':s.tx_errors}
+            stats.append(rec)
+            key=(rec['dpid'],rec['port_no'])
+            prev=self.port_prev.get(key)
+            if prev:
+                dt=max(1e-6,now-prev['ts'])
+                rates.append({
+                    'timestamp':now,'dpid':rec['dpid'],'port_no':rec['port_no'],
+                    'tx_bps':(rec['tx_bytes']-prev['tx_bytes'])*8.0/dt,
+                    'rx_bps':(rec['rx_bytes']-prev['rx_bytes'])*8.0/dt})
+            self.port_prev[key]={**rec,'ts':now}
+        self.port_stats=[x for x in self.port_stats if x['dpid']!=ev.msg.datapath.id]+stats
+        self.port_rates=[x for x in self.port_rates if x['dpid']!=ev.msg.datapath.id]+rates
+        self.last_stats_ts=now
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def flow_stats_reply(self, ev):
+        now=time.time(); flows=[]
+        for s in ev.msg.body:
+            flows.append({
+                'timestamp':now,'dpid':ev.msg.datapath.id,'priority':s.priority,
+                'table_id':s.table_id,'packet_count':s.packet_count,
+                'byte_count':s.byte_count})
+        self.flow_stats=[f for f in self.flow_stats if f['dpid']!=ev.msg.datapath.id]+flows
+        self.last_stats_ts=now
+
+    # -------------------- Path Helpers --------------------
+    def _k_shortest_paths(self, src, dst, k=2):
+        if src==dst: return []
+        key=(src,dst,k)
+        if key in self.k_paths_cached: return self.k_paths_cached[key]
         try:
-            return jget(url)
-        except Exception as e:
-            last=e
-            time.sleep(backoff*(i+1))
-    raise last
+            gen=nx.shortest_simple_paths(self.G,src,dst)
+            paths=[]
+            for p in gen:
+                if len(p)>=2: paths.append(p)
+                if len(paths)>=k: break
+            self.k_paths_cached[key]=paths
+            return paths
+        except Exception: return []
 
-def get_hosts(base):
-    return safe_get(f"{base}/hosts")
+    def _path_ports(self, dpids, dst_mac=None):
+        hops=[]
+        for i in range(len(dpids)-1):
+            u,v=dpids[i],dpids[i+1]
+            data=self.G.get_edge_data(u,v)
+            if not data: return []
+            hops.append({'dpid':u,'out_port':data.get('u_port')})
+        last=dpids[-1]
+        if dst_mac and dst_mac in self.hosts and self.hosts[dst_mac]['dpid']==last:
+            hops.append({'dpid':last,'out_port':self.hosts[dst_mac]['port']})
+        return hops
 
-def get_paths(base, src, dst, k):
-    return safe_get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}")
+    def _install_path(self, src_mac, dst_mac, dpids):
+        cookie=int(hashlib.md5(f"{src_mac}->{dst_mac}".encode()).hexdigest()[:16],16)
+        for hop in self._path_ports(dpids,dst_mac):
+            dp=self.datapaths.get(hop['dpid'])
+            if not dp: continue
+            p,ofp=dp.ofproto_parser,dp.ofproto
+            match=p.OFPMatch(eth_dst=dst_mac)
+            act=[p.OFPActionOutput(hop['out_port'])]
+            inst=[p.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,act)]
+            dp.send_msg(p.OFPFlowMod(datapath=dp,priority=100,match=match,
+                                     instructions=inst,cookie=cookie,idle_timeout=60))
+        self.routes[(src_mac,dst_mac)]={'cookie':cookie,'path':dpids}
+        self.last_action_ts[(src_mac,dst_mac)]=time.time()
 
-def get_ports(base):
-    # used to estimate a crude reward
-    # try a few REST shapes relative to base (which already includes /api/v1)
-    for ep in ("stats/ports", "metrics/ports", "ports"):
-        url = f"{base.rstrip('/')}/{ep}"
+    def _links_with_tx_bps(self):
+        out=[]
+        idx=defaultdict(dict)
+        for r in self.port_rates:
+            idx[r['dpid']][r['port_no']]=r.get('tx_bps',0.0)
+        for u,v,data in self.G.edges(data=True):
+            out.append({'src_dpid':u,'dst_dpid':v,
+                        'src_port':data.get('u_port'),'dst_port':data.get('v_port'),
+                        'tx_bps':idx.get(u,{}).get(data.get('u_port'),0.0)})
+        return out
+
+
+class RESTController(ControllerBase):
+    def __init__(self, req, link, data, **config):
+        super().__init__(req, link, data, **config)
+        self.app: SDNRouterREST = data[API_INSTANCE]
+
+    @route('health', '/api/v1/health', methods=['GET'])
+    def health(self, req, **kwargs):
+        return j({'status':'ok','last_stats_ts':self.app.last_stats_ts})
+
+    @route('hosts', '/api/v1/hosts', methods=['GET'])
+    def hosts(self, req, **kwargs):
+        hosts=[{'mac':m,'dpid':h['dpid'],'port':h['port']}
+               for m,h in self.app.hosts.items()
+               if h['port'] not in self.app.core_ports[h['dpid']]]
+        return j(hosts)
+
+    @route('paths', '/api/v1/paths', methods=['GET'])
+    def paths(self, req, **kwargs):
+        p=req.params; s=p.get('src_mac'); d=p.get('dst_mac'); k=int(p.get('k',2))
+        if not s or not d: return j({'error':'missing src_mac/dst_mac'},400)
+        if s not in self.app.hosts or d not in self.app.hosts: return j({'error':'hosts not learned'},404)
+        sdp,did=self.app.hosts[s]['dpid'],self.app.hosts[d]['dpid']
+        paths=self.app._k_shortest_paths(sdp,did,k)
+        out=[{'path_id':i,'dpids':p,'hops':self.app._path_ports(p,dst_mac=d)} for i,p in enumerate(paths)]
+        return j(out)
+
+    # Avoid shadowing the @route decorator
+    @route('action_route', '/api/v1/actions/route', methods=['POST'])
+    def apply_route(self, req, **kwargs):
         try:
-            return jget(url)
+            data=json.loads(req.body)
+            validate(instance=data,schema=ROUTE_SCHEMA)
+        except ValidationError as ve:
+            return j({'error':'validation','detail':ve.message},400)
         except Exception:
-            pass
-    return []
+            return j({'error':'invalid_json'},400)
+        s,d=data['src_mac'],data['dst_mac']
+        if s not in self.app.hosts or d not in self.app.hosts:
+            return j({'error':'hosts_not_learned'},404)
+        paths=data.get('path')
+        if not paths:
+            sdp=self.app.hosts[s]['dpid']; ddp=self.app.hosts[d]['dpid']
+            allp=self.app._k_shortest_paths(sdp,ddp,k=int(data.get('k',2)))
+            if not allp: return j({'error':'no_path'},409)
+            pid=min(int(data.get('path_id',0)),len(allp)-1)
+            paths=allp[pid]
+        key=(s,d); prev=self.app.routes.get(key,{}).get('path')
+        if prev and prev!=paths:
+            delta=time.time()-self.app.last_action_ts.get(key,0.0)
+            if delta<self.app.route_cooldown:
+                retry_after = max(0, int(round(self.app.route_cooldown - delta)))
+                # add header for clients that honor HTTP Retry-After
+                return j({'error':'cooldown_active','retry_after':retry_after},
+                         429, headers={'Retry-After': str(retry_after)})
+        self.app._install_path(s,d,paths)
+        self.app._install_path(d,s,list(reversed(paths)))
+        return j({'status':'applied','path':paths})
 
-def post_route(base, src, dst, path_id, k):
-    return jpost(f"{base}/actions/route", {
-        "src_mac": src, "dst_mac": dst, "path_id": path_id, "k": k
-    })
+    @route('stats_ports','/api/v1/stats/ports',methods=['GET'])
+    def stats_ports(self,req,**kw):
+        return j(self.app.port_stats)
 
-def ports_to_map(payload):
-    # returns {(dpid,port_no) -> (rx_bytes, tx_bytes)}
-    m={}
-    if isinstance(payload, dict) and "ports" in payload:
-        payload = payload["ports"]
-    if isinstance(payload, dict):
-        for dpid, plist in payload.items():
-            for p in plist or []:
-                d=int(p.get("dpid", int(dpid)))
-                po=int(p.get("port_no", p.get("port", 0)))
-                m[(d,po)] = (int(p.get("rx_bytes",0)), int(p.get("tx_bytes",0)))
-    elif isinstance(payload, list):
-        for p in payload:
-            d=int(p.get("dpid",0))
-            po=int(p.get("port_no", p.get("port", 0)))
-            m[(d,po)] = (int(p.get("rx_bytes",0)), int(p.get("tx_bytes",0)))
-    return m
+    @route('stats_flows','/api/v1/stats/flows',methods=['GET'])
+    def stats_flows(self,req,**kw):
+        return j(self.app.flow_stats)
 
-def path_hop_ports(path):
-    # convert path.hops [{"dpid":1,"out_port":2}, ...] → list of (dpid,out_port)
-    hops = path.get("hops") or []
-    return [(int(h.get("dpid",0)), int(h.get("out_port",0))) for h in hops]
+    @route('metrics_links','/api/v1/metrics/links',methods=['GET'])
+    def metrics_links(self,req,**kw):
+        return j(self.app._links_with_tx_bps())
 
-def _extract_retry_after_from_body(e):
-    try:
-        # urllib.error.HTTPError is also a file-like object
-        payload = e.read().decode("utf-8")
-        data = json.loads(payload)
-        return int(data.get("retry_after", 0))
-    except Exception:
-        return 0
+    # NEW: provide /api/v1/metrics/ports so agents/supervisors don't 404
+    @route('metrics_ports','/api/v1/metrics/ports',methods=['GET'])
+    def metrics_ports(self, req, **kw):
+        """
+        Returns the latest computed per-port rates.
+        Shape: [{"timestamp", "dpid", "port_no", "tx_bps", "rx_bps"}, ...]
+        """
+        return j(self.app.port_rates)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--controller", default="http://127.0.0.1:8080/api/v1")
-    ap.add_argument("--epsilon", type=float, default=0.2)
-    ap.add_argument("--k", type=int, default=2)
-    ap.add_argument("--src", required=True, help="src MAC")
-    ap.add_argument("--dst", required=True, help="dst MAC")
-    ap.add_argument("--duration", type=int, default=120)
-    ap.add_argument("--interval", type=float, default=1.0)
-    ap.add_argument("--cooldown_ms", type=int, default=300)
-    args = ap.parse_args()
+    # -------- Added to match OpenAPI/docs --------
+    @route('topo_nodes', '/api/v1/topology/nodes', methods=['GET'])
+    def topo_nodes(self, req, **kwargs):
+        nodes = sorted(list(self.app.G.nodes()))
+        return j(nodes)
 
-    base = args.controller.rstrip("/")
-    hosts = get_hosts(base)
-    print(f"[agent] Controller={base} | src={args.src} dst={args.dst}", file=sys.stderr)
+    @route('topo_links', '/api/v1/topology/links', methods=['GET'])
+    def topo_links(self, req, **kwargs):
+        links = []
+        for u, v, data in self.app.G.edges(data=True):
+            links.append({
+                'src_dpid': u, 'dst_dpid': v,
+                'src_port': data.get('u_port'),
+                'dst_port': data.get('v_port')
+            })
+        return j(links)
 
-    # Q-table for K arms
-    q = [0.0]*args.k
-    plays = [0]*args.k
-    t0=time.time()
-    t=0
-    while time.time()-t0 < args.duration:
-        # fetch available paths
-        try:
-            paths = get_paths(base, args.src, args.dst, args.k)
-        except Exception as e:
-            print("[agent] paths not available; retrying...", file=sys.stderr)
-            time.sleep(1.0)
-            continue
-        if not isinstance(paths, list) or len(paths)==0:
-            print("[agent] paths not available; retrying...", file=sys.stderr)
-            time.sleep(1.0); continue
+    @route('actions_list', '/api/v1/actions/list', methods=['GET'])
+    def actions_list(self, req, **kwargs):
+        out = []
+        for (s, d), meta in self.app.routes.items():
+            out.append({'src_mac': s, 'dst_mac': d,
+                        'cookie': meta.get('cookie'),
+                        'path': meta.get('path')})
+        return j(out)
 
-        # epsilon-greedy
-        explore = (random.random() < args.epsilon)
-        if explore:
-            a = random.randrange(min(len(paths), args.k))
-        else:
-            a = max(range(min(len(paths), args.k)), key=lambda i: q[i])
+    @route('action_route_delete', '/api/v1/actions/route', methods=['DELETE'])
+    def route_delete(self, req, **kwargs):
+        p = req.params
+        s = p.get('src_mac'); d = p.get('dst_mac')
+        if not s or not d:
+            return j({'error': 'missing src_mac/dst_mac'}, 400)
+        key = (s, d)
+        meta = self.app.routes.get(key)
+        if not meta:
+            return j({'error': 'not_found'}, 404)
 
-        # measure tx_bytes before action on chosen hop ports
-        ports_before = ports_to_map(get_ports(base))
-        chosen = paths[a]
-        hop_ports = path_hop_ports(chosen)
+        cookie = meta.get('cookie')
+        for dp in list(self.app.datapaths.values()):
+            ofp = dp.ofproto
+            parser = dp.ofproto_parser
+            mod = parser.OFPFlowMod(
+                datapath=dp,
+                cookie=cookie, cookie_mask=0xffffffffffffffff,
+                table_id=ofp.OFPTT_ALL,
+                command=ofp.OFPFC_DELETE,
+                out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+                match=parser.OFPMatch()
+            )
+            dp.send_msg(mod)
 
-        # try to install route
-        try:
-            resp = post_route(base, args.src, args.dst, a, args.k)
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                # Prefer HTTP header; fallback to JSON body; otherwise to CLI flag
-                header_retry = int(e.headers.get("Retry-After", "0") or 0)
-                body_retry = _extract_retry_after_from_body(e)
-                wait = max(header_retry, body_retry, args.cooldown_ms/1000.0)
-                print("[agent] POST failed: 429 Too Many Requests", file=sys.stderr)
-                print(f"[agent] Cooldown active, waiting {wait:.1f}s", file=sys.stderr)
-                time.sleep(wait)
-                # do not advance time step / epsilon on a rejected switch
-                # just retry loop after wait
-                continue
-            else:
-                print(f"[agent] route POST error: {e}", file=sys.stderr)
-                time.sleep(0.5); continue
-        except Exception as e:
-            print(f"[agent] route POST error: {e}", file=sys.stderr)
-            time.sleep(0.5); continue
-
-        # wait a small interval, then re-read to build a crude reward
-        time.sleep(args.interval)
-        ports_after = ports_to_map(get_ports(base))
-
-        # reward = inverse of avg tx delta across hop out_ports
-        deltas=[]
-        for dpid, outp in hop_ports:
-            b = ports_before.get((dpid,outp), (0,0))[1]
-            a_tx = ports_after.get((dpid,outp), (0,0))[1]
-            deltas.append(max(0, a_tx - b))
-        avg_tx = mean(deltas) if deltas else 0.0
-        reward = 1.0 / (1.0 + avg_tx/1e6)  # scale a bit
-
-        plays[a] += 1
-        q[a] += (reward - q[a]) / plays[a]
-
-        print(f"[t={t}] path_id={a} dpids={chosen.get('dpids')} eps={args.epsilon:0.3f}", file=sys.stderr)
-        print(f"  reward={reward:0.3f} | q[{a}]={q[a]:0.3f} | plays={plays[a]}", file=sys.stderr)
-
-        # slight epsilon decay
-        args.epsilon = max(0.05, args.epsilon * 0.99)
-        t += 1
-
-    # summary
-    print(json.dumps({"q": q, "plays": plays}))
-    return 0
-
-if __name__ == "__main__":
-    sys.exit(main())
+        self.app.routes.pop(key, None)
+        self.app.last_action_ts.pop(key, None)
+        return j({'status': 'deleted'})
