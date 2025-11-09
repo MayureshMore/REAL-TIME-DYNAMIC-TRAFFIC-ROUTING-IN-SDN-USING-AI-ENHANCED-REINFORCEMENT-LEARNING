@@ -128,7 +128,7 @@ python3 "${AGENT}" \
 AGENT_PID=$!
 
 # tail progress (do NOT wait on this; it never exits on its own)
-( sleep 2; tail -n +1 -f /tmp/topo.out /tmp/logger.out /tmp/agent.out 2>/dev/null ) &
+( sleep 2; tail -n 200 /tmp/topo.out /tmp/logger.out /tmp/agent.out 2>/dev/null ) &
 TAIL_PID=$!
 
 # Wait strictly for the finite jobs
