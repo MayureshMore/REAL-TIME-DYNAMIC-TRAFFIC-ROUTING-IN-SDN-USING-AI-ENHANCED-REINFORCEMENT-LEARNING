@@ -3,143 +3,132 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# --- configurable knobs (env overrides allowed) ---
+# Inputs (exported by auto_demo.sh)
 DURATION="${DURATION:-120}"
 EPSILON="${EPSILON:-0.2}"
 K="${K:-2}"
+SRC_MAC="${SRC_MAC:-}"
+DST_MAC="${DST_MAC:-}"
 CTRL_HOST="${CTRL_HOST:-127.0.0.1}"
 WSAPI_PORT="${WSAPI_PORT:-8080}"
 OF_PORT="${OF_PORT:-6633}"
-PATH_WAIT_SECS="${PATH_WAIT_SECS:-120}"
-WARMUP_PINGS="${WARMUP_PINGS:-10}"
-LOG_INTERVAL="${LOG_INTERVAL:-1}"
-
-# Correct locations:
-LOGGER="${LOGGER:-${REPO}/scripts/metrics/poll_ports.py}"
-AGENT="${AGENT:-${REPO}/rl-agent/bandit_agent.py}"
-
-ENSURE="${REPO}/scripts/ensure_controller.sh"
-TOPO="${REPO}/scripts/topos/two_path.py"
 REUSE_TOPOLOGY="${REUSE_TOPOLOGY:-0}"
-
-CSV_DIR="${REPO}/docs/baseline"
-mkdir -p "${CSV_DIR}"
-CSV_OUT="${CSV_DIR}/ports_rl_$(date +%Y%m%d_%H%M%S).csv"
 
 API_BASE="http://${CTRL_HOST}:${WSAPI_PORT}/api/v1"
 
-die() { echo "[x] $*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+# Paths
+BANDIT="${REPO}/rl-agent/bandit_agent.py"
+LOGGER="${REPO}/scripts/metrics/port_logger.py"   # your existing logger
+CSV_DIR="${REPO}/docs/baseline"
+CSV_OUT="${CSV_DIR}/ports_rl_$(date +%Y%m%d_%H%M%S).csv"
 
+indent(){ sed 's/^/  /'; }
+say(){ printf "%s\n" "$*"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "[x] missing $1" >&2; exit 1; }; }
+need python3
 need curl
 need jq
-need python3
 
-if ! grep -q "ensure_controller.sh" <<<"${ENSURE}"; then
-  die "ENSURE path looks wrong: ${ENSURE}"
-fi
-
-if [ "${REUSE_TOPOLOGY}" = "1" ]; then
-  echo "[prep] Reusing existing controller/topology (skipping mn -c + ensure_controller)"
-else
-  echo "[prep] sudo mn -c"
-  sudo mn -c >/dev/null 2>&1 || true
-
-  echo "[ctrl] Starting controller OF:${OF_PORT} REST:${WSAPI_PORT}"
-  WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" >/dev/null
-fi
-
-TOPO_PID=""
-if [ "${REUSE_TOPOLOGY}" = "1" ]; then
-  echo "[topo] Reusing externally managed two-path demo"
-else
-  echo "[topo] Launching two-path demo for ${DURATION}s"
-  sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${DURATION}" > /tmp/topo.out 2>&1 &
-  TOPO_PID=$!
-fi
-
-echo "[wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
-deadline=$(( $(date +%s) + PATH_WAIT_SECS ))
-H1="${SRC_MAC:-}"
-H2="${DST_MAC:-}"
-
-if [ -n "${H1}" ] && [ -n "${H2}" ]; then
-  echo "[wait] Using provided MACs ${H1} -> ${H2}"
-  if ! curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null; then
-    echo "[wait] Provided MACs not ready yet; falling back to discovery"
-    H1=""; H2=""
+# Mininet helpers for traffic generation on reused topology
+mn_pid_of() {
+  # Return the PID of a mininet host by name (h1, h2)
+  local name="$1"
+  # Modern mininet keeps pids under /var/run/mn
+  if [ -r "/var/run/mn/${name}/pid" ]; then
+    cat "/var/run/mn/${name}/pid"
+    return 0
   fi
+  # Fallback: pgrep (best-effort)
+  pgrep -f "mininet:${name}$" | head -n1 || true
+}
+
+mnexec_safe() {
+  local host="$1"; shift
+  local pid
+  pid="$(mn_pid_of "${host}")"
+  [ -n "${pid}" ] || { echo "[x] could not find PID for ${host}"; return 1; }
+  sudo mnexec -a "${pid}" "$@"
+}
+
+# Resolve IPs from controller (consistent with your two_path.py)
+resolve_ip() {
+  local mac="$1"
+  curl -sf "${API_BASE}/hosts" \
+    | jq -r --arg mac "${mac}" '.[] | select(.mac==$mac) | .ipv4 // empty' \
+    | head -n1
+}
+
+# If MACs/IPs not provided, bail out explicitly
+[ -n "${SRC_MAC}" ] && [ -n "${DST_MAC}" ] || { echo "[x] SRC_MAC/DST_MAC not set" >&2; exit 1; }
+SRC_IP="$(resolve_ip "${SRC_MAC}")"
+DST_IP="$(resolve_ip "${DST_MAC}")"
+[ -n "${SRC_IP}" ] && [ -n "${DST_IP}" ] || { echo "[x] could not resolve SRC/DST IPs"; exit 1; }
+
+# Choose traffic tool
+TRAFFIC_TOOL=""
+if command -v iperf3 >/dev/null 2>&1; then
+  TRAFFIC_TOOL="iperf3"
+elif command -v iperf >/dev/null 2>&1; then
+  TRAFFIC_TOOL="iperf"
+fi
+if [ -z "${TRAFFIC_TOOL}" ]; then
+  echo "[x] neither iperf3 nor iperf found; install one or add a project-local traffic generator" >&2
+  exit 1
 fi
 
-if [ -z "${H1}" ] || [ -z "${H2}" ]; then
-  attempt=0
-  while [ "$(date +%s)" -lt "${deadline}" ]; do
-    attempt=$((attempt+1))
-    hosts_json="$(curl -sf "${API_BASE}/hosts" || echo '[]')"
-    path_count=0
-    host_count="$(jq 'length' <<<"${hosts_json}")"
-    if [ "${host_count}" -ge 2 ]; then
-      H1="$(jq -r '.[0].mac' <<<"${hosts_json}")"
-      H2="$(jq -r '.[1].mac' <<<"${hosts_json}")"
-      paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" || echo '[]')"
-      path_count="$(jq 'length' <<<"${paths_json}")"
-      if [ "${path_count}" -ge 1 ]; then
-        echo "[wait] Paths available for ${H1} -> ${H2}"
-        break
-      fi
-    fi
-    if (( attempt % 10 == 0 )); then
-      echo "[wait] attempt ${attempt}: hosts=${host_count}, paths=${path_count:-0}"
-    fi
-    sleep 1
-  done
+say "[prep] Reusing existing controller/topology (skipping mn -c + ensure_controller)"
+say "[topo] Reusing externally managed two-path demo"
+
+# Warm K-path cache both ways
+curl -sf "${API_BASE}/paths?src_mac=${SRC_MAC}&dst_mac=${DST_MAC}&k=${K}" >/dev/null || true
+curl -sf "${API_BASE}/paths?src_mac=${DST_MAC}&dst_mac=${SRC_MAC}&k=${K}" >/dev/null || true
+
+say "[wait] Using provided MACs ${SRC_MAC} -> ${DST_MAC}"
+say "[wait] Confirmed paths for ${SRC_MAC} -> ${DST_MAC} on reused topology"
+
+# Start traffic
+say "[traffic] ${TRAFFIC_TOOL} h1 -> h2 for ${DURATION}s (UDP ~50M)"
+if [ "${TRAFFIC_TOOL}" = "iperf3" ]; then
+  # server on h2
+  mnexec_safe h2 iperf3 -s -1 >/tmp/iperf3_server.log 2>&1 &
+  srv_pid=$!
+  # slight delay for server bind
+  sleep 0.5
+  # client on h1
+  mnexec_safe h1 iperf3 -u -l 1470 -b 50M -c "${DST_IP}" -t "${DURATION}" >/tmp/iperf3_client.log 2>&1 &
+  cli_pid=$!
+else
+  # legacy iperf
+  mnexec_safe h2 iperf -s -u >/tmp/iperf_server.log 2>&1 &
+  srv_pid=$!
+  sleep 0.5
+  mnexec_safe h1 iperf -u -b 50M -l 1470 -c "${DST_IP}" -t "${DURATION}" >/tmp/iperf_client.log 2>&1 &
+  cli_pid=$!
 fi
 
-if [ -z "${H1}" ] || [ -z "${H2}" ]; then
-  echo "[wait] timed out waiting for hosts/paths; see logs below" >&2
-  [ -f /tmp/topo.out ] && { echo "[debug] tail /tmp/topo.out" >&2; tail -n 40 /tmp/topo.out >&2; }
-  [ -f "${HOME}/ryu-controller.log" ] && { echo "[debug] tail ~/ryu-controller.log" >&2; tail -n 40 "${HOME}/ryu-controller.log" >&2; }
-  die "timed out waiting for hosts/paths; check controller logs"
-fi
+# Start logger and agent (both bounded by timeout = DURATION + small pad)
+say "[logger] Logging to ${CSV_OUT}; polling ${API_BASE} every 1s; duration=${DURATION}s"
+timeout "$(( DURATION + 5 ))s" python3 "${LOGGER}" \
+  --api "${API_BASE}" --interval 1.0 --duration "${DURATION}" --out "${CSV_OUT}" >/tmp/logger.out 2>&1 &
+logger_pid=$!
 
-if [ "${REUSE_TOPOLOGY}" = "1" ]; then
-  echo "[wait] Confirmed paths for ${H1} -> ${H2} on reused topology"
-fi
+say "[agent] epsilon=${EPSILON} k=${K} src=${SRC_MAC} dst=${DST_MAC}"
+timeout "$(( DURATION + 5 ))s" python3 "${BANDIT}" \
+  --api "${API_BASE}" --epsilon "${EPSILON}" --k "${K}" \
+  --src "${SRC_MAC}" --dst "${DST_MAC}" >/tmp/agent.out 2>&1 &
+agent_pid=$!
 
-echo "[warmup] Sending ${WARMUP_PINGS} ICMP echos via Mininet demo (already running)"
+# Wait for all three
+wait ${agent_pid} || true
+wait ${logger_pid} || true
+wait ${cli_pid} || true
+wait ${srv_pid} || true
 
-echo "[logger] Logging to ${CSV_OUT}; polling ${API_BASE} every ${LOG_INTERVAL}s; duration=${DURATION}s"
-python3 "${LOGGER}" \
-  --controller "${API_BASE}" \
-  --outfile "${CSV_OUT}" \
-  --interval "${LOG_INTERVAL}" \
-  --duration "${DURATION}" > /tmp/logger.out 2>&1 &
-LOGGER_PID=$!
-
-echo "[agent] epsilon=${EPSILON} k=${K} src=${H1} dst=${H2}"
-python3 "${AGENT}" \
-  --controller "${API_BASE}" \
-  --epsilon "${EPSILON}" \
-  --k "${K}" \
-  --src "${H1}" \
-  --dst "${H2}" \
-  --duration "${DURATION}" \
-  --interval "${LOG_INTERVAL}" > /tmp/agent.out 2>&1 &
-AGENT_PID=$!
-
-# tail progress (do NOT wait on this; it never exits on its own)
-( sleep 2; tail -n 200 /tmp/topo.out /tmp/logger.out /tmp/agent.out 2>/dev/null ) &
-TAIL_PID=$!
-
-# Wait strictly for the finite jobs
-wait "${AGENT_PID}" "${LOGGER_PID}"
-
-# Now stop tail and (optionally) the topo we launched
-kill "${TAIL_PID}" >/dev/null 2>&1 || true
-
-if [ -n "${TOPO_PID}" ]; then
-  wait "${TOPO_PID}" 2>/dev/null || true
-fi
-
-echo "RL run complete. CSV: ${CSV_OUT}"
+say "RL run complete. CSV: ${CSV_OUT}"
 echo "${CSV_OUT}"
+
+# Optional: emit last lines of logs for quick debugging
+echo "==> /tmp/logger.out <=="; tail -n +1 /tmp/logger.out | indent || true
+echo
+echo "==> /tmp/agent.out <=="; tail -n +1 /tmp/agent.out | indent || true
