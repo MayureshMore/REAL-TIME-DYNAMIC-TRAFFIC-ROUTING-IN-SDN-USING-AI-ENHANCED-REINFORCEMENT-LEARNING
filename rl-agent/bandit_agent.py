@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
 # rl-agent/bandit_agent.py
 #
-# Epsilon-greedy over a STABLE top-K path set.
-# - Fetch paths once (or refresh only if fewer than K).
-# - Map action index -> controller path_id, never use list index as path_id.
-# - Gentle 429 backoff with jitter.
-# - Keep playing space size == K so exploration actually hits all arms.
+# Minimal epsilon-greedy bandit that flips between k paths from the controller:
+#   GET  /api/v1/paths?src_mac=..&dst_mac=..&k=K
+#   POST /api/v1/actions/route {"src_mac","dst_mac","path_id","k"}
+#
+# Key improvements vs previous version:
+# - Idempotency on the client side: only POST when the chosen path changes
+#   or after a small TTL (REAPPLY_TTL). This avoids 429s from duplicate installs.
+# - Honors Retry-After (if present) and uses sensible backoff otherwise.
+# - Slightly slower epsilon decay with a floor so short demos actually explore.
 
-import argparse, json, random, sys, time, urllib.request, urllib.error
+import argparse
+import json
+import random
+import sys
+import time
+import urllib.request
+import urllib.error
+from time import monotonic
 from statistics import mean
+
 
 def jget(url, timeout=3.0):
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
+
 def jpost(url, payload, timeout=3.0):
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
 
 def safe_get(url, retries=3, backoff=0.5):
     last = None
@@ -31,11 +45,14 @@ def safe_get(url, retries=3, backoff=0.5):
             time.sleep(backoff * (i + 1))
     raise last
 
+
 def get_hosts(base):
     return safe_get(f"{base}/hosts")
 
+
 def get_paths(base, src, dst, k):
     return safe_get(f"{base}/paths?src_mac={src}&dst_mac={dst}&k={k}")
+
 
 def get_ports(base):
     # Try a few REST shapes relative to base (which already includes /api/v1)
@@ -47,13 +64,21 @@ def get_ports(base):
             pass
     return []
 
+
 def post_route(base, src, dst, path_id, k):
     return jpost(f"{base}/actions/route", {
         "src_mac": src, "dst_mac": dst, "path_id": path_id, "k": k
     })
 
+
 def ports_to_map(payload):
-    # returns {(dpid,port_no) -> (rx_bytes, tx_bytes)}
+    """
+    Normalize ports payload into {(dpid,port_no) -> (rx_bytes, tx_bytes)}.
+    Accepts either:
+      {"ports": {"1":[{...}], "2":[...], ...}}  or
+      {"1":[{...}], "2":[...]}  or
+      [{dpid, port_no/port, rx_bytes, tx_bytes}, ...]
+    """
     m = {}
     if isinstance(payload, dict) and "ports" in payload:
         payload = payload["ports"]
@@ -70,45 +95,12 @@ def ports_to_map(payload):
             m[(d, po)] = (int(p.get("rx_bytes", 0)), int(p.get("tx_bytes", 0)))
     return m
 
+
 def path_hop_ports(path):
-    # convert path.hops [{"dpid":1,"out_port":2}, ...] → list of (dpid,out_port)
+    # Convert path.hops [{"dpid":1,"out_port":2}, ...] → list of (dpid,out_port)
     hops = path.get("hops") or []
     return [(int(h.get("dpid", 0)), int(h.get("out_port", 0))) for h in hops]
 
-def build_actions(base, src, dst, k, prev_actions=None):
-    """
-    Returns a stable list of length k:
-      actions[i] = {"idx": i, "path_id": <controller id>, "dpids": [...], "hops": [...]}
-    If the controller returns < k paths, reuse previous actions when available.
-    """
-    try:
-        paths = get_paths(base, src, dst, k)
-    except Exception:
-        paths = []
-
-    actions = []
-    if isinstance(paths, list):
-        for i, p in enumerate(paths[:k]):
-            actions.append({
-                "idx": i,
-                "path_id": p.get("path_id", i),
-                "dpids": p.get("dpids", []),
-                "hops": p.get("hops", []),
-                "raw": p
-            })
-
-    # If controller only returned 1 path, try to fall back to previous known actions
-    if len(actions) < k and prev_actions:
-        # Merge previous to keep action space at size k
-        for i in range(len(actions), k):
-            if i < len(prev_actions):
-                actions.append(prev_actions[i])
-
-    # As a last resort, duplicate the first one (still allows bookkeeping)
-    while len(actions) < k and actions:
-        actions.append(actions[0])
-
-    return actions
 
 def main():
     ap = argparse.ArgumentParser()
@@ -120,101 +112,119 @@ def main():
     ap.add_argument("--duration", type=int, default=120)
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--cooldown_ms", type=int, default=300)
-    ap.add_argument("--paths_refresh_secs", type=float, default=15.0)
+    ap.add_argument("--reapply_ttl", type=float, default=5.0, help="seconds before reapplying the same path")
     args = ap.parse_args()
 
     base = args.controller.rstrip("/")
-    _ = get_hosts(base)  # sanity ping
+    _ = get_hosts(base)  # warm-up / verify controller is reachable
     print(f"[agent] Controller={base} | src={args.src} dst={args.dst}", file=sys.stderr)
 
     # Q-table for K arms
-    K = args.k
-    q = [0.0] * K
-    plays = [0] * K
+    q = [0.0] * args.k
+    plays = [0] * args.k
 
-    # Build a STABLE action set and refresh periodically
-    actions = build_actions(base, args.src, args.dst, K, prev_actions=None)
-    if len(actions) < K:
-        print(f"[agent] warning: controller returned only {len(actions)} paths; keeping action space at K={K} via cache", file=sys.stderr)
-    last_paths_refresh = time.time()
+    last_applied_idx = None
+    last_apply_ts = 0.0
+    REAPPLY_TTL = float(args.reapply_ttl)
 
     t0 = time.time()
-    step = 0
-    rng = random.Random()  # independent RNG
-
+    t = 0
     while time.time() - t0 < args.duration:
-        # Periodically refresh available paths, but keep length K
-        if time.time() - last_paths_refresh >= args.paths_refresh_secs:
-            actions = build_actions(base, args.src, args.dst, K, prev_actions=actions)
-            last_paths_refresh = time.time()
+        # fetch available paths
+        try:
+            paths = get_paths(base, args.src, args.dst, args.k)
+        except Exception:
+            print("[agent] paths not available; retrying...", file=sys.stderr)
+            time.sleep(1.0)
+            continue
+        if not isinstance(paths, list) or len(paths) == 0:
+            print("[agent] paths not available; retrying...", file=sys.stderr)
+            time.sleep(1.0)
+            continue
 
-        # epsilon-greedy over fixed K actions
-        if rng.random() < args.epsilon:
-            a_idx = rng.randrange(K)           # 0..K-1, guarantees both arms get sampled
+        if t == 0:
+            print(f"[agent] k={args.k} | paths_returned={len(paths)}", file=sys.stderr)
+
+        arms = min(len(paths), args.k)
+
+        # epsilon-greedy
+        explore = (random.random() < args.epsilon)
+        if explore:
+            a = random.randrange(arms)
         else:
-            a_idx = max(range(K), key=lambda i: q[i])
+            a = max(range(arms), key=lambda i: q[i])
 
-        chosen = actions[a_idx]
-        hop_ports = path_hop_ports(chosen["raw"]) if chosen.get("raw") else []
+        chosen = paths[a]
 
-        # measure tx_bytes before action
+        # Decide whether we actually need to POST (avoid duplicate spam)
+        now = monotonic()
+        need_post = (last_applied_idx is None) or (a != last_applied_idx) or ((now - last_apply_ts) >= REAPPLY_TTL)
+
+        # measure tx before (we still measure even if we don't POST so we can form a reward sample)
         ports_before = ports_to_map(get_ports(base))
 
-        # try to install route using the controller's path_id (NOT the list index)
-        try:
-            _ = post_route(base, args.src, args.dst, int(chosen["path_id"]), K)
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                # backoff with jitter; respect Retry-After if present
-                ra = e.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait = max(float(ra), 0.0)
-                    except Exception:
-                        wait = args.cooldown_ms / 1000.0
+        # Try to install route only if needed
+        if need_post:
+            try:
+                _ = post_route(base, args.src, args.dst, a, arms)
+                last_applied_idx = a
+                last_apply_ts = now
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    retry_after_hdr = e.headers.get("Retry-After")
+                    if retry_after_hdr:
+                        try:
+                            wait = float(retry_after_hdr)
+                        except ValueError:
+                            wait = max(args.cooldown_ms / 1000.0, 1.0)
+                    else:
+                        wait = max(args.cooldown_ms / 1000.0, 1.0)
+                    print("[agent] POST failed: 429 Too Many Requests", file=sys.stderr)
+                    print(f"[agent] Cooldown active, waiting {wait:.1f}s", file=sys.stderr)
+                    time.sleep(wait)
+                    # Retry on next loop without incrementing t (duration wall-clock governs exit)
+                    continue
                 else:
-                    wait = args.cooldown_ms / 1000.0
-                wait += rng.uniform(0.2, 0.8)
-                print("[agent] POST failed: 429 Too Many Requests", file=sys.stderr)
-                print(f"[agent] Cooldown active, waiting {wait:.1f}s", file=sys.stderr)
-                time.sleep(wait)
-                # do not update Q/plays/step on a failed action; retry next loop
-                continue
-            else:
+                    print(f"[agent] route POST error: {e}", file=sys.stderr)
+                    time.sleep(0.5)
+                    continue
+            except Exception as e:
                 print(f"[agent] route POST error: {e}", file=sys.stderr)
                 time.sleep(0.5)
                 continue
-        except Exception as e:
-            print(f"[agent] route POST error: {e}", file=sys.stderr)
-            time.sleep(0.5)
-            continue
 
-        # wait a small interval, then re-read to build a crude reward
+        # wait interval, then sample reward
         time.sleep(args.interval)
         ports_after = ports_to_map(get_ports(base))
 
         # reward = inverse of avg tx delta across hop out_ports
+        hop_ports = path_hop_ports(chosen)
         deltas = []
         for dpid, outp in hop_ports:
             b = ports_before.get((dpid, outp), (0, 0))[1]
             a_tx = ports_after.get((dpid, outp), (0, 0))[1]
             deltas.append(max(0, a_tx - b))
         avg_tx = mean(deltas) if deltas else 0.0
-        reward = 1.0 / (1.0 + avg_tx / 1e6)  # scale a bit
+        reward = 1.0 / (1.0 + avg_tx / 1e6)  # scale
 
-        plays[a_idx] += 1
-        # incremental mean update
-        q[a_idx] += (reward - q[a_idx]) / plays[a_idx]
+        plays[a] += 1
+        q[a] += (reward - q[a]) / plays[a]
 
-        print(f"[t={step}] path_idx={a_idx} path_id={chosen['path_id']} dpids={chosen.get('dpids')} eps={args.epsilon:0.3f}", file=sys.stderr)
-        print(f"  reward={reward:0.3f} | q[{a_idx}]={q[a_idx]:0.3f} | plays={plays[a_idx]}", file=sys.stderr)
+        print(
+            f"[t={t}] path_idx={a} path_id={chosen.get('path_id', a)} "
+            f"dpids={chosen.get('dpids')} eps={args.epsilon:0.3f}",
+            file=sys.stderr,
+        )
+        print(f"  reward={reward:0.3f} | q[{a}]={q[a]:0.3f} | plays={plays[a]}", file=sys.stderr)
 
-        # slight epsilon decay, floor at 0.05
-        args.epsilon = max(0.05, args.epsilon * 0.99)
-        step += 1
+        # slower decay with a floor so we keep exploring in short demos
+        args.epsilon = max(0.10, args.epsilon * 0.995)
+        t += 1
 
+    # summary
     print(json.dumps({"q": q, "plays": plays}))
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

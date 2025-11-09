@@ -16,7 +16,7 @@ LOG_INTERVAL="${LOG_INTERVAL:-1}"
 
 # Correct locations:
 LOGGER="${LOGGER:-${REPO}/scripts/metrics/poll_ports.py}"
-AGENT="${AGENT:-${REPO}/rl-agent/bandit_agent.py}"   # <-- fixed path here
+AGENT="${AGENT:-${REPO}/rl-agent/bandit_agent.py}"
 
 ENSURE="${REPO}/scripts/ensure_controller.sh"
 TOPO="${REPO}/scripts/topos/two_path.py"
@@ -28,7 +28,6 @@ CSV_OUT="${CSV_DIR}/ports_rl_$(date +%Y%m%d_%H%M%S).csv"
 
 API_BASE="http://${CTRL_HOST}:${WSAPI_PORT}/api/v1"
 
-# --- helpers ---
 die() { echo "[x] $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
@@ -36,7 +35,6 @@ need curl
 need jq
 need python3
 
-# make sure ensure_controller.sh path sane
 if ! grep -q "ensure_controller.sh" <<<"${ENSURE}"; then
   die "ENSURE path looks wrong: ${ENSURE}"
 fi
@@ -60,7 +58,6 @@ else
   TOPO_PID=$!
 fi
 
-# wait for hosts + paths to be ready
 echo "[wait] Waiting up to ${PATH_WAIT_SECS}s for hosts and k-paths..."
 deadline=$(( $(date +%s) + PATH_WAIT_SECS ))
 H1="${SRC_MAC:-}"
@@ -68,7 +65,6 @@ H2="${DST_MAC:-}"
 
 if [ -n "${H1}" ] && [ -n "${H2}" ]; then
   echo "[wait] Using provided MACs ${H1} -> ${H2}"
-  # sanity check that controller sees them
   if ! curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null; then
     echo "[wait] Provided MACs not ready yet; falling back to discovery"
     H1=""; H2=""
@@ -118,7 +114,6 @@ if [ "${REUSE_TOPOLOGY}" = "1" ]; then
 fi
 
 echo "[warmup] Sending ${WARMUP_PINGS} ICMP echos via Mininet demo (already running)"
-# the topo script already does a ping flood; the warmup is just to tick MAC learning
 
 echo "[logger] Logging to ${CSV_OUT}; polling ${API_BASE} every ${LOG_INTERVAL}s; duration=${DURATION}s"
 python3 "${LOGGER}" \
@@ -137,11 +132,10 @@ python3 "${AGENT}" \
   --duration "${DURATION}" \
   --interval "${LOG_INTERVAL}" > /tmp/agent.out 2>&1 &
 
-# tail progress (best-effort)
 ( sleep 2; tail -n +1 -f /tmp/topo.out /tmp/logger.out /tmp/agent.out 2>/dev/null ) &
 TAIL_PID=$!
 
-# wait for background jobs (topo+logger+agent)
+# wait for logger + agent (and topo if we launched it)
 wait
 kill "${TAIL_PID}" >/dev/null 2>&1 || true
 

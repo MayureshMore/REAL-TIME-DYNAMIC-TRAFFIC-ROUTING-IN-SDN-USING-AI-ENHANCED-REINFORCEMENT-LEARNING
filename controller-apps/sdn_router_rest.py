@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Unified SDN controller app: L2 learning + topology + routing + REST + stats
 
+import os
 from collections import defaultdict
 import hashlib, json, time, networkx as nx
 from ryu.base import app_manager
@@ -52,7 +53,13 @@ class SDNRouterREST(app_manager.RyuApp):
         self.k_paths_cached = {}
         self.routes = {}
         self.last_action_ts = {}
-        self.route_cooldown = 5.0
+
+        # cooldown (seconds) between DIFFERENT path changes for a (src,dst)
+        # allow override via env; default relaxed to 1.0s to reduce 429s
+        try:
+            self.route_cooldown = float(os.environ.get("ROUTE_COOLDOWN", "1.0"))
+        except ValueError:
+            self.route_cooldown = 1.0
 
         # Stats
         self.port_stats = []
@@ -60,7 +67,6 @@ class SDNRouterREST(app_manager.RyuApp):
         self.port_rates = []
         self.flow_stats = []
         self.last_stats_ts = 0.0
-        self.cache_ttl = 2.0
 
         # Threads
         self.monitor_interval = 2
@@ -207,18 +213,29 @@ class SDNRouterREST(app_manager.RyuApp):
 
     # -------------------- Path Helpers --------------------
     def _k_shortest_paths(self, src, dst, k=2):
+        """
+        Deterministic k-shortest simple paths (stable order):
+        - Generate with networkx
+        - Keep first k
+        - Sort by (length, tuple(dpids)) to break ties stably
+        """
         if src==dst: return []
         key=(src,dst,k)
         if key in self.k_paths_cached: return self.k_paths_cached[key]
         try:
-            gen=nx.shortest_simple_paths(self.G,src,dst)
-            paths=[]
+            gen = nx.shortest_simple_paths(self.G, src, dst)
+            paths = []
             for p in gen:
-                if len(p)>=2: paths.append(p)
-                if len(paths)>=k: break
+                if len(p) >= 2:
+                    paths.append(p)
+                if len(paths) >= k:
+                    break
+            # stable order on ties
+            paths = sorted(paths, key=lambda seq: (len(seq), tuple(seq)))
             self.k_paths_cached[key]=paths
             return paths
-        except Exception: return []
+        except Exception:
+            return []
 
     def _path_ports(self, dpids, dst_mac=None):
         hops=[]
@@ -284,7 +301,6 @@ class RESTController(ControllerBase):
         out=[{'path_id':i,'dpids':p,'hops':self.app._path_ports(p,dst_mac=d)} for i,p in enumerate(paths)]
         return j(out)
 
-    # Avoid shadowing the @route decorator
     @route('action_route', '/api/v1/actions/route', methods=['POST'])
     def apply_route(self, req, **kwargs):
         try:
@@ -294,9 +310,12 @@ class RESTController(ControllerBase):
             return j({'error':'validation','detail':ve.message},400)
         except Exception:
             return j({'error':'invalid_json'},400)
+
         s,d=data['src_mac'],data['dst_mac']
         if s not in self.app.hosts or d not in self.app.hosts:
             return j({'error':'hosts_not_learned'},404)
+
+        # resolve desired path (by explicit list or by path_id)
         paths=data.get('path')
         if not paths:
             sdp=self.app.hosts[s]['dpid']; ddp=self.app.hosts[d]['dpid']
@@ -304,14 +323,17 @@ class RESTController(ControllerBase):
             if not allp: return j({'error':'no_path'},409)
             pid=min(int(data.get('path_id',0)),len(allp)-1)
             paths=allp[pid]
-        key=(s,d); prev=self.app.routes.get(key,{}).get('path')
+
+        key=(s,d)
+        prev=self.app.routes.get(key,{}).get('path')
         if prev and prev!=paths:
             delta=time.time()-self.app.last_action_ts.get(key,0.0)
             if delta<self.app.route_cooldown:
                 retry_after = max(0, int(round(self.app.route_cooldown - delta)))
-                # add header for clients that honor HTTP Retry-After
                 return j({'error':'cooldown_active','retry_after':retry_after},
                          429, headers={'Retry-After': str(retry_after)})
+
+        # install forward + reverse
         self.app._install_path(s,d,paths)
         self.app._install_path(d,s,list(reversed(paths)))
         return j({'status':'applied','path':paths})
@@ -328,20 +350,15 @@ class RESTController(ControllerBase):
     def metrics_links(self,req,**kw):
         return j(self.app._links_with_tx_bps())
 
-    # NEW: provide /api/v1/metrics/ports so agents/supervisors don't 404
     @route('metrics_ports','/api/v1/metrics/ports',methods=['GET'])
     def metrics_ports(self, req, **kw):
-        """
-        Returns the latest computed per-port rates.
-        Shape: [{"timestamp", "dpid", "port_no", "tx_bps", "rx_bps"}, ...]
-        """
+        """Latest per-port rates."""
         return j(self.app.port_rates)
 
-    # -------- Added to match OpenAPI/docs --------
+    # -------- extra topology + actions helpers --------
     @route('topo_nodes', '/api/v1/topology/nodes', methods=['GET'])
     def topo_nodes(self, req, **kwargs):
-        nodes = sorted(list(self.app.G.nodes()))
-        return j(nodes)
+        return j(sorted(list(self.app.G.nodes())))
 
     @route('topo_links', '/api/v1/topology/links', methods=['GET'])
     def topo_links(self, req, **kwargs):
