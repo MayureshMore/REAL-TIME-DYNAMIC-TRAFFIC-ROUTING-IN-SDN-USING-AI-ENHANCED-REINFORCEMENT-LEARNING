@@ -75,14 +75,13 @@ if [ -z "${H1}" ] || [ -z "${H2}" ]; then
   attempt=0
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     attempt=$((attempt+1))
-    hosts_json="$(curl -sf "${API_BASE}/hosts" || echo "[]")"
+    hosts_json="$(curl -sf "${API_BASE}/hosts" || echo '[]')"
     path_count=0
     host_count="$(jq 'length' <<<"${hosts_json}")"
-
     if [ "${host_count}" -ge 2 ]; then
       H1="$(jq -r '.[0].mac' <<<"${hosts_json}")"
       H2="$(jq -r '.[1].mac' <<<"${hosts_json}")"
-      paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" || echo "[]")"
+      paths_json="$(curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" || echo '[]')"
       path_count="$(jq 'length' <<<"${paths_json}")"
       if [ "${path_count}" -ge 1 ]; then
         echo "[wait] Paths available for ${H1} -> ${H2}"
@@ -98,14 +97,8 @@ fi
 
 if [ -z "${H1}" ] || [ -z "${H2}" ]; then
   echo "[wait] timed out waiting for hosts/paths; see logs below" >&2
-  if [ -f /tmp/topo.out ]; then
-    echo "[debug] tail /tmp/topo.out" >&2
-    tail -n 40 /tmp/topo.out >&2
-  fi
-  if [ -f "${HOME}/ryu-controller.log" ]; then
-    echo "[debug] tail ~/ryu-controller.log" >&2
-    tail -n 40 "${HOME}/ryu-controller.log" >&2
-  fi
+  [ -f /tmp/topo.out ] && { echo "[debug] tail /tmp/topo.out" >&2; tail -n 40 /tmp/topo.out >&2; }
+  [ -f "${HOME}/ryu-controller.log" ] && { echo "[debug] tail ~/ryu-controller.log" >&2; tail -n 40 "${HOME}/ryu-controller.log" >&2; }
   die "timed out waiting for hosts/paths; check controller logs"
 fi
 
@@ -121,6 +114,7 @@ python3 "${LOGGER}" \
   --outfile "${CSV_OUT}" \
   --interval "${LOG_INTERVAL}" \
   --duration "${DURATION}" > /tmp/logger.out 2>&1 &
+LOGGER_PID=$!
 
 echo "[agent] epsilon=${EPSILON} k=${K} src=${H1} dst=${H2}"
 python3 "${AGENT}" \
@@ -131,12 +125,16 @@ python3 "${AGENT}" \
   --dst "${H2}" \
   --duration "${DURATION}" \
   --interval "${LOG_INTERVAL}" > /tmp/agent.out 2>&1 &
+AGENT_PID=$!
 
+# tail progress (do NOT wait on this; it never exits on its own)
 ( sleep 2; tail -n +1 -f /tmp/topo.out /tmp/logger.out /tmp/agent.out 2>/dev/null ) &
 TAIL_PID=$!
 
-# wait for logger + agent (and topo if we launched it)
-wait
+# Wait strictly for the finite jobs
+wait "${AGENT_PID}" "${LOGGER_PID}"
+
+# Now stop tail and (optionally) the topo we launched
 kill "${TAIL_PID}" >/dev/null 2>&1 || true
 
 if [ -n "${TOPO_PID}" ]; then
