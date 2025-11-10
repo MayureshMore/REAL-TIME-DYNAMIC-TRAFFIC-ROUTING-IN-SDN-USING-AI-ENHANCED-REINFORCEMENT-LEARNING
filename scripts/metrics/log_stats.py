@@ -45,17 +45,24 @@ def iter_port_entries(data):
         return
 
     if isinstance(data, list):
-        # shape B: [{"dpid":1, "<k>":[...]}, ...] ; <k> can be ports/stats/entries depending on controller
+        # shape B1: list of blocks with nested list under one of these keys
+        handled_any = False
         for block in data:
             if not isinstance(block, dict):
                 continue
             dpid = block.get("dpid")
-            # try common container keys
             for key in ("ports", "stats", "entries"):
                 if key in block and isinstance(block[key], list):
                     for ent in block[key]:
                         yield dpid, ent
+                        handled_any = True
                     break
+        if handled_any:
+            return
+        # shape B2: flat list of entries already (your controller does this)
+        for ent in data:
+            if isinstance(ent, dict) and "port_no" in ent:
+                yield ent.get("dpid"), ent
         return
 
     # Unknown shape: do nothing
@@ -67,8 +74,8 @@ def row_from_entry(ts, dpid, port, ent):
         ts,
         dpid,
         port,
-        ent.get("rx_packets", 0),
-        ent.get("tx_packets", 0),
+        ent.get("rx_packets", ent.get("rx_pkts", 0)),
+        ent.get("tx_packets", ent.get("tx_pkts", 0)),
         ent.get("rx_bytes", 0),
         ent.get("tx_bytes", 0),
         ent.get("rx_dropped", 0),
