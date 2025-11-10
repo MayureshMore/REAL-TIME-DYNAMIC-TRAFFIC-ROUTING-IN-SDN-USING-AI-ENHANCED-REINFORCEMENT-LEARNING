@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
-# Plot Results for SDN RL Experiments
-# -----------------------------------
-# Reads port-metrics CSV logs and plots avg throughput (Mbps),
-# packet drops/s, and packet errors/s over time.
-# Handles our headers from log_stats.py:
-#   tx_rate_mbps/tx_rate_bps (preferred), or falls back to bytes delta.
-# Computes drop/error rates from counter deltas.
-
-import argparse, os, re, glob
+import argparse, os, re
 from datetime import datetime
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 
 plt.rcParams.update({
@@ -23,7 +14,6 @@ plt.rcParams.update({
 })
 
 TS_RE = re.compile(r"(\d{8}_\d{6})")  # e.g., 20251109_193823
-OFPP_LOCAL = 0xFFFFFFFE
 
 def _extract_ts(path: str):
     m = TS_RE.search(os.path.basename(path))
@@ -36,8 +26,7 @@ def _extract_ts(path: str):
 
 def pick_latest(files):
     files = [f for f in files if os.path.isfile(f)]
-    if not files:
-        return []
+    if not files: return []
     files.sort(key=_extract_ts)
     return [files[-1]]
 
@@ -53,100 +42,84 @@ def classify_files(file_list):
 
 def load_csv(file_path):
     df = pd.read_csv(file_path)
-    required = {"ts","dpid","port"}
-    if not required.issubset(df.columns):
-        raise ValueError(f"{file_path} missing required columns {required}")
-    # drop LOCAL/invalid ports if present in the CSV (extra safety)
-    try:
-        df = df[~df["port"].isin([0, OFPP_LOCAL])]
-    except Exception:
-        pass
-    df = df.sort_values(["port","dpid","ts"]).reset_index(drop=True)
-    df["ts0"] = df["ts"] - df["ts"].min()
+    if 'ts' not in df.columns:
+        raise ValueError(f"Missing 'ts' column in {file_path}")
+    df = df.sort_values(['dpid','port','ts'] if {'dpid','port'}.issubset(df.columns) else 'ts').reset_index(drop=True)
+    # normalize time origin to 0
+    df['ts'] = df['ts'] - df['ts'].iloc[0]
     return df
 
-def _per_port_delta_rate(df, col, timecol="ts"):
-    """Compute per-second rate from a cumulative counter column."""
-    # work per (dpid, port)
-    df = df.sort_values(["dpid","port",timecol]).copy()
-    df["dt"] = df.groupby(["dpid","port"])[timecol].diff()
-    df["dv"] = df.groupby(["dpid","port"])[col].diff()
-    # avoid division by zero/NaN
-    df["rate"] = np.where(df["dt"] > 0, df["dv"]/df["dt"], np.nan)
-    return df
+def _has(cols, *names):
+    return all(n in cols for n in names)
+
+def _nonzero_mean(s):
+    s = pd.Series(s)
+    return float((s.fillna(0) != 0).mean())
+
+def derive_rates_from_counters(df):
+    """Return a copy with rx_rate_bps/tx_rate_bps computed from rx_bytes/tx_bytes deltas."""
+    if not _has(df.columns, 'dpid','port','ts','rx_bytes','tx_bytes'):
+        return df.copy()
+    d = df.copy()
+    d = d.sort_values(['dpid','port','ts'])
+    for col, out in [('rx_bytes','rx_rate_bps'), ('tx_bytes','tx_rate_bps')]:
+        d[out] = d.groupby(['dpid','port'])[col].diff() * 8.0 / d.groupby(['dpid','port'])['ts'].diff()
+        d[out] = d[out].clip(lower=0).fillna(0.0)
+    d['rx_rate_mbps'] = d['rx_rate_bps'] / 1e6
+    d['tx_rate_mbps'] = d['tx_rate_bps'] / 1e6
+    # drops/errors per second if we only have counters
+    if _has(d.columns, 'rx_dropped','tx_dropped'):
+        d['drop_ps'] = d.groupby(['dpid','port'])['rx_dropped'].diff().fillna(0) + \
+                       d.groupby(['dpid','port'])['tx_dropped'].diff().fillna(0)
+        d['drop_ps'] = (d['drop_ps'] / d.groupby(['dpid','port'])['ts'].diff()).clip(lower=0).fillna(0.0)
+    if _has(d.columns, 'rx_errors','tx_errors'):
+        d['err_ps'] = d.groupby(['dpid','port'])['rx_errors'].diff().fillna(0) + \
+                      d.groupby(['dpid','port'])['tx_errors'].diff().fillna(0)
+        d['err_ps'] = (d['err_ps'] / d.groupby(['dpid','port'])['ts'].diff()).clip(lower=0).fillna(0.0)
+    return d
 
 def aggregate_metrics(df):
+    """Aggregate system-wide averages per timestamp with generous column support."""
     cols = set(df.columns)
+    d = df.copy()
 
-    # -------- Throughput (Mbps) --------
-    if "tx_rate_mbps" in cols and df["tx_rate_mbps"].notna().any():
-        thr = df.groupby("ts0")["tx_rate_mbps"].mean().rename("throughput_mbps")
-    elif "tx_rate_bps" in cols and df["tx_rate_bps"].notna().any():
-        thr = (df.groupby("ts0")["tx_rate_bps"].mean() / 1e6).rename("throughput_mbps")
-    elif {"tx_bytes","ts"}.issubset(cols):
-        # bytes -> bits per second, then to Mbps
-        tmp = _per_port_delta_rate(df[["dpid","port","ts","ts0","tx_bytes"]].copy(),
-                                   col="tx_bytes", timecol="ts")
-        # dv is bytes; convert to Mbps
-        tmp["mbps"] = (tmp["rate"].astype(float) * 8.0) / 1e6
-        thr = tmp.groupby("ts0")["mbps"].mean().rename("throughput_mbps")
+    # Prefer using *_rate_mbps, then *_mbps, then derive from bytes.
+    if _has(cols, 'tx_rate_mbps', 'rx_rate_mbps'):
+        thr = d.groupby('ts')['tx_rate_mbps'].mean()
+    elif _has(cols, 'tx_mbps', 'rx_mbps'):
+        thr = d.groupby('ts')['tx_mbps'].mean()
+    elif _has(cols, 'tx_rate_bps', 'rx_rate_bps'):
+        thr = d.groupby('ts')['tx_rate_bps'].mean() / 1e6
+    elif _has(cols, 'tx_bps', 'rx_bps'):
+        thr = d.groupby('ts')['tx_bps'].mean() / 1e6
     else:
-        raise ValueError("Cannot derive throughput: need tx_rate_mbps/tx_rate_bps or tx_bytes + ts")
+        # Derive from counters
+        d = derive_rates_from_counters(d)
+        thr = d.groupby('ts')['tx_rate_mbps'].mean()
 
-    # -------- Drops/Errors (pkts/s) from counter deltas --------
-    drops = None
-    if {"rx_dropped","tx_dropped","ts"}.issubset(cols):
-        d1 = _per_port_delta_rate(df[["dpid","port","ts","ts0","rx_dropped"]].copy(),
-                                  col="rx_dropped", timecol="ts")
-        d2 = _per_port_delta_rate(df[["dpid","port","ts","ts0","tx_dropped"]].copy(),
-                                  col="tx_dropped", timecol="ts")
-        # average across ports; sum rx+tx
-        d_agg = d1[["ts0","rate"]].rename(columns={"rate":"rx_rate"}).merge(
-            d2[["ts0","rate"]].rename(columns={"rate":"tx_rate"}), how="outer", on="ts0")
-        d_agg = d_agg.fillna(0.0)
-        d_agg["drops"] = (d_agg["rx_rate"] + d_agg["tx_rate"]) / 2.0
-        drops = d_agg.groupby("ts0")["drops"].mean()
+    drops = d.groupby('ts')['drop_ps'].mean() if 'drop_ps' in d.columns else pd.Series(0.0, index=thr.index)
+    errs  = d.groupby('ts')['err_ps'].mean()  if 'err_ps'  in d.columns else pd.Series(0.0, index=thr.index)
 
-    errs = None
-    if {"rx_errors","tx_errors","ts"}.issubset(cols):
-        e1 = _per_port_delta_rate(df[["dpid","port","ts","ts0","rx_errors"]].copy(),
-                                  col="rx_errors", timecol="ts")
-        e2 = _per_port_delta_rate(df[["dpid","port","ts","ts0","tx_errors"]].copy(),
-                                  col="tx_errors", timecol="ts")
-        e_agg = e1[["ts0","rate"]].rename(columns={"rate":"rx_rate"}).merge(
-            e2[["ts0","rate"]].rename(columns={"rate":"tx_rate"}), how="outer", on="ts0")
-        e_agg = e_agg.fillna(0.0)
-        e_agg["errors"] = (e_agg["rx_rate"] + e_agg["tx_rate"]) / 2.0
-        errs = e_agg.groupby("ts0")["errors"].mean()
-
-    out = pd.DataFrame({"ts": thr.index, "throughput_mbps": thr.values})
-    if drops is not None:
-        out = out.merge(pd.DataFrame({"ts": drops.index, "drops": drops.values}),
-                        how="left", on="ts")
-    else:
-        out["drops"] = 0.0
-
-    if errs is not None:
-        out = out.merge(pd.DataFrame({"ts": errs.index, "errors": errs.values}),
-                        how="left", on="ts")
-    else:
-        out["errors"] = 0.0
-
-    return out.fillna(0.0)
+    out = pd.DataFrame({
+        'ts': thr.index,
+        'throughput_mbps': thr.values,
+        'drops': drops.reindex(thr.index, fill_value=0.0).values,
+        'errors': errs.reindex(thr.index, fill_value=0.0).values
+    })
+    out = out.sort_values('ts').reset_index(drop=True)
+    return out
 
 def plot_metric(ax, df, label, field, ylabel):
-    ax.plot(df["ts"], df[field], label=label)
+    ax.plot(df['ts'], df[field], label=label)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(ylabel)
     ax.legend(loc="upper right")
 
 def main():
     ap = argparse.ArgumentParser(description="Plot performance graphs from metrics CSVs")
-    ap.add_argument("--files", nargs="+", required=True,
-                    help="CSV files (we auto-pick newest Baseline and newest RL).")
-    ap.add_argument("--labels", nargs="+", required=False,
-                    help="Optional labels; if exactly two, mapped to newest Baseline and newest RL.")
-    ap.add_argument("--out", default=None, help="Output folder (default: docs/baseline/plots/)")
+    ap.add_argument("--files", nargs="+", required=True)
+    ap.add_argument("--labels", nargs="+")
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     out_dir = args.out or "docs/baseline/plots"
@@ -154,17 +127,13 @@ def main():
 
     base_files, rl_files = classify_files(args.files)
     if args.labels and len(args.labels) == 2:
-        base_files = pick_latest(base_files)
-        rl_files = pick_latest(rl_files)
-        files = base_files + rl_files
-        labels = args.labels
+        base_files, rl_files = pick_latest(base_files), pick_latest(rl_files)
+        files, labels = base_files + rl_files, args.labels
     else:
         base_files = pick_latest(base_files) if len(base_files) > 1 else base_files
-        rl_files = pick_latest(rl_files) if len(rl_files) > 1 else rl_files
+        rl_files   = pick_latest(rl_files)   if len(rl_files) > 1 else rl_files
         files = base_files + rl_files
-        labels = []
-        if base_files: labels.append("Baseline")
-        if rl_files: labels.append("RL")
+        labels = (["Baseline"] if base_files else []) + (["RL"] if rl_files else [])
 
     if not files:
         raise SystemExit("[x] No valid CSVs found among the provided --files")
@@ -181,6 +150,12 @@ def main():
             plot_metric(ax1, agg, label, "throughput_mbps", "Throughput (Mbps)")
             plot_metric(ax2, agg, label, "drops", "Packet Drops (pkts/s)")
             plot_metric(ax3, agg, label, "errors", "Packet Errors (pkts/s)")
+
+            # Sanity prints
+            nz = _nonzero_mean(agg['throughput_mbps'])
+            if nz == 0.0:
+                print(f"[warn] {os.path.basename(file)}: throughput appears all zeros; "
+                      "check that traffic was generated and counters are changing.")
         except Exception as e:
             print(f"[!] Error processing {file}: {e}")
 

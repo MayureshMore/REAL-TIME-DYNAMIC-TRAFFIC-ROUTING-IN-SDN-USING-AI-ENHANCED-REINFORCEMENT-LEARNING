@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import argparse, time, sys, csv, requests
 from urllib.parse import urlparse
-
-OFPP_LOCAL = 0xFFFFFFFE  # 4294967294
+from collections import defaultdict
 
 def norm_base(u: str) -> str:
     u = (u or "").strip()
@@ -22,25 +21,19 @@ def get_json(url, timeout=2.0):
     return r.json()
 
 def poll_ports(base):
-    # Our controller exposes /stats/ports
+    # Our controller exposes <base>stats/ports
     return get_json(base + "stats/ports")
 
 def iter_port_entries(data):
-    """Yield (dpid, entry_dict) across supported response shapes."""
+    # Accept several shapes; yield (dpid, entry_dict)
     if isinstance(data, dict):
-        # {"1":[...], "2":[...]}
         for dpid_str, entries in data.items():
-            try:
-                dpid = int(dpid_str)
-            except Exception:
-                dpid = dpid_str
+            dpid = int(dpid_str) if str(dpid_str).isdigit() else dpid_str
             for ent in entries or []:
                 yield dpid, ent
         return
-
     if isinstance(data, list):
-        # block list with nested list
-        handled_any = False
+        handled = False
         for block in data:
             if not isinstance(block, dict):
                 continue
@@ -49,41 +42,27 @@ def iter_port_entries(data):
                 if key in block and isinstance(block[key], list):
                     for ent in block[key]:
                         yield dpid, ent
-                        handled_any = True
+                        handled = True
                     break
-        if handled_any:
+        if handled:
             return
-        # already flat
         for ent in data:
             if isinstance(ent, dict) and "port_no" in ent:
                 yield ent.get("dpid"), ent
         return
 
-def row_from_entry(ts, dpid, port, ent):
-    return [
-        ts,
-        dpid,
-        port,
-        ent.get("rx_packets", ent.get("rx_pkts", 0)),
-        ent.get("tx_packets", ent.get("tx_pkts", 0)),
-        ent.get("rx_bytes", 0),
-        ent.get("tx_bytes", 0),
-        ent.get("rx_dropped", 0),
-        ent.get("tx_dropped", 0),
-        ent.get("rx_errors", 0),
-        ent.get("tx_errors", 0),
-        ent.get("rx_rate_bps", 0.0),
-        ent.get("tx_rate_bps", 0.0),
-        ent.get("rx_rate_mbps", 0.0),
-        ent.get("tx_rate_mbps", 0.0),
-        ent.get("loss_pct", 0.0),
-        ent.get("err_pct", 0.0),
-    ]
+def as_int(x, default=0):
+    try: return int(x)
+    except Exception: return default
+
+def as_float(x, default=0.0):
+    try: return float(x)
+    except Exception: return default
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--controller", default="http://127.0.0.1:8080/api/v1",
-                    help="Controller REST base, e.g. http://127.0.0.1:8080/api/v1 or 127.0.0.1:8080")
+                    help="Controller REST base, e.g. http://127.0.0.1:8080/api/v1")
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--duration", type=int, default=120)
     ap.add_argument("--out", required=True)
@@ -92,24 +71,29 @@ def main():
     base = norm_base(args.controller)
 
     header = [
-        "ts","dpid","port","rx_packets","tx_packets","rx_bytes","tx_bytes",
+        "ts","dpid","port",
+        "rx_packets","tx_packets","rx_bytes","tx_bytes",
         "rx_dropped","tx_dropped","rx_errors","tx_errors",
         "rx_rate_bps","tx_rate_bps","rx_rate_mbps","tx_rate_mbps",
         "loss_pct","err_pct"
     ]
 
-    start = time.time()
-    next_poll = start
-    end = start + args.duration
+    # State to compute instantaneous rates from deltas
+    # prev[(dpid,port)] = (ts, rx_bytes, tx_bytes, rx_dropped, tx_dropped, rx_errors, tx_errors)
+    prev = {}
 
+    end = time.time() + args.duration
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
+
+        next_poll = time.time()
         while time.time() < end:
             now = time.time()
             if now < next_poll:
                 time.sleep(max(0.0, next_poll - now))
             next_poll += args.interval
+
             ts = time.time()
             try:
                 data = poll_ports(base)
@@ -117,22 +101,53 @@ def main():
                 print(f"Fetch error: {e}", file=sys.stdout, flush=True)
                 continue
 
-            wrote_any = False
+            wrote = False
             for dpid, ent in iter_port_entries(data):
                 port = ent.get("port_no", 0)
+                if isinstance(port, str):
+                    if port.upper() == "LOCAL":
+                        continue
+                    try:
+                        port = int(port)
+                    except Exception:
+                        continue
 
-                # drop invalid/LOCAL ports
-                try:
-                    p_int = int(port)
-                except Exception:
-                    continue
-                if p_int in (0, OFPP_LOCAL):
-                    continue
+                rx_bytes    = as_int(ent.get("rx_bytes"))
+                tx_bytes    = as_int(ent.get("tx_bytes"))
+                rx_packets  = as_int(ent.get("rx_packets", ent.get("rx_pkts", 0)))
+                tx_packets  = as_int(ent.get("tx_packets", ent.get("tx_pkts", 0)))
+                rx_dropped  = as_int(ent.get("rx_dropped"))
+                tx_dropped  = as_int(ent.get("tx_dropped"))
+                rx_errors   = as_int(ent.get("rx_errors"))
+                tx_errors   = as_int(ent.get("tx_errors"))
 
-                w.writerow(row_from_entry(ts, dpid, p_int, ent))
-                wrote_any = True
+                key = (dpid, port)
+                rx_bps = tx_bps = 0.0
+                if key in prev:
+                    pts, prx_b, ptx_b, prx_d, ptx_d, prx_e, ptx_e = prev[key]
+                    dt = max(1e-6, ts - pts)
+                    rx_bps = max(0.0, (rx_bytes - prx_b) * 8.0 / dt)
+                    tx_bps = max(0.0, (tx_bytes - ptx_b) * 8.0 / dt)
+                prev[key] = (ts, rx_bytes, tx_bytes, rx_dropped, tx_dropped, rx_errors, tx_errors)
 
-            if not wrote_any and isinstance(data, (dict, list)):
+                # loss / err percentage (best-effort)
+                loss_pct = err_pct = 0.0
+                total_pkts = rx_packets + tx_packets
+                if total_pkts > 0:
+                    loss_pct = 100.0 * (rx_dropped + tx_dropped) / total_pkts
+                    err_pct  = 100.0 * (rx_errors + tx_errors) / total_pkts
+
+                w.writerow([
+                    ts, dpid, port,
+                    rx_packets, tx_packets, rx_bytes, tx_bytes,
+                    rx_dropped, tx_dropped, rx_errors, tx_errors,
+                    rx_bps, tx_bps, rx_bps/1e6, tx_bps/1e6,
+                    loss_pct, err_pct
+                ])
+                wrote = True
+
+            if not wrote:
+                # No entries this tick; keep going
                 pass
         f.flush()
 
