@@ -3,23 +3,16 @@ import argparse, time, sys, csv, requests
 from urllib.parse import urlparse
 
 def norm_base(u: str) -> str:
-    """
-    Accept either a full base (e.g., http://127.0.0.1:8080/api/v1)
-    or just host[:port] (e.g., 127.0.0.1:8080). Returns a normalized
-    base like 'http://127.0.0.1:8080/api/v1/'.
-    """
     u = (u or "").strip()
     if not u:
         return "http://127.0.0.1:8080/api/v1/"
-    # If user passed just host[:port] without scheme
     if "://" not in u:
         u = f"http://{u}"
-    parsed = urlparse(u)
-    # If path is empty, assume /api/v1
-    path = parsed.path or "/api/v1"
+    p = urlparse(u)
+    path = p.path or "/api/v1"
     if not path.endswith("/"):
-        path = path + "/"
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
+        path += "/"
+    return f"{p.scheme}://{p.netloc}{path}"
 
 def get_json(url, timeout=2.0):
     r = requests.get(url, timeout=timeout)
@@ -27,10 +20,49 @@ def get_json(url, timeout=2.0):
     return r.json()
 
 def poll_ports(base):
-    # ryu rest stats: /stats/ports
+    # Expected endpoints:
+    #  - our controller:  <base>stats/ports
+    # Returns either:
+    #  A) dict: { "1": [ {...}, {...} ], "2": [ {...} ] }
+    #  B) list: [ {"dpid":1,"ports":[...]}, {"dpid":2,"ports":[...]} ]
     return get_json(base + "stats/ports")
 
+def iter_port_entries(data):
+    """
+    Yields tuples (dpid, entry_dict) across the supported response shapes.
+    Each entry_dict should already look like Ryu's port stats dict
+    (rx_packets, tx_packets, rx_bytes, tx_bytes, rx_dropped, tx_dropped, rx_errors, tx_errors, port_no, ...)
+    """
+    if isinstance(data, dict):
+        # shape A: {"1":[...], "2":[...]}
+        for dpid_str, entries in data.items():
+            try:
+                dpid = int(dpid_str)
+            except Exception:
+                dpid = dpid_str
+            for ent in entries or []:
+                yield dpid, ent
+        return
+
+    if isinstance(data, list):
+        # shape B: [{"dpid":1, "<k>":[...]}, ...] ; <k> can be ports/stats/entries depending on controller
+        for block in data:
+            if not isinstance(block, dict):
+                continue
+            dpid = block.get("dpid")
+            # try common container keys
+            for key in ("ports", "stats", "entries"):
+                if key in block and isinstance(block[key], list):
+                    for ent in block[key]:
+                        yield dpid, ent
+                    break
+        return
+
+    # Unknown shape: do nothing
+    return
+
 def row_from_entry(ts, dpid, port, ent):
+    # default-get avoids KeyError when the controller omits derived fields
     return [
         ts,
         dpid,
@@ -54,7 +86,7 @@ def row_from_entry(ts, dpid, port, ent):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--controller", default="http://127.0.0.1:8080/api/v1",
-                    help="Controller REST base. Either full base (http://host:port/api/v1) or host[:port]")
+                    help="Controller REST base, e.g. http://127.0.0.1:8080/api/v1 or 127.0.0.1:8080")
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--duration", type=int, default=120)
     ap.add_argument("--out", required=True)
@@ -62,7 +94,6 @@ def main():
 
     base = norm_base(args.controller)
 
-    # CSV header
     header = [
         "ts","dpid","port","rx_packets","tx_packets","rx_bytes","tx_bytes",
         "rx_dropped","tx_dropped","rx_errors","tx_errors",
@@ -86,27 +117,30 @@ def main():
             try:
                 data = poll_ports(base)
             except Exception as e:
-                # Write nothing but keep going; stdout keeps the error trace minimal
                 print(f"Fetch error: {e}", file=sys.stdout, flush=True)
                 continue
 
-            # data shape from /stats/ports: { "DPID": [ { "port_no":..., "rx_packets":..., ...}, ... ], ... }
-            for dpid_str, entries in data.items():
-                try:
-                    dpid = int(dpid_str)
-                except Exception:
-                    # sometimes dpids come as ints already
-                    dpid = dpid_str
-                for ent in entries:
-                    port = ent.get("port_no", 0)
-                    # skip 'LOCAL' and invalids if present
-                    if isinstance(port, str) and port.upper() == "LOCAL":
+            wrote_any = False
+            for dpid, ent in iter_port_entries(data):
+                port = ent.get("port_no", 0)
+                # skip LOCAL or bad ports
+                if isinstance(port, str):
+                    if port.upper() == "LOCAL":
                         continue
                     try:
                         port = int(port)
                     except Exception:
                         continue
-                    w.writerow(row_from_entry(ts, dpid, port, ent))
+                elif not isinstance(port, int):
+                    continue
+
+                w.writerow(row_from_entry(ts, dpid, port, ent))
+                wrote_any = True
+
+            # If the shape was totally unknown, don't crash—just report once.
+            if not wrote_any and isinstance(data, (dict, list)):
+                # likely all entries were LOCAL or empty; that's fine
+                pass
         f.flush()
 
 if __name__ == "__main__":
