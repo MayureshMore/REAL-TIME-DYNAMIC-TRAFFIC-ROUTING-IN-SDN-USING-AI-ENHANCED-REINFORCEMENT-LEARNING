@@ -1,169 +1,147 @@
 #!/usr/bin/env python3
-# Plot Results for SDN RL Experiments
-# -----------------------------------
-# Reads port metrics CSV logs and plots average throughput, drop rate,
-# and error rate over time. Outputs graphs under docs/baseline/plots/.
+import argparse, time, sys, csv, requests
+from urllib.parse import urlparse
 
-import argparse
-import os
-import re
-import glob
-from datetime import datetime
-import pandas as pd
-import matplotlib.pyplot as plt
+def norm_base(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return "http://127.0.0.1:8080/api/v1/"
+    if "://" not in u:
+        u = f"http://{u}"
+    p = urlparse(u)
+    path = p.path or "/api/v1"
+    if not path.endswith("/"):
+        path += "/"
+    return f"{p.scheme}://{p.netloc}{path}"
 
-plt.rcParams.update({
-    "figure.figsize": (8, 5),
-    "axes.grid": True,
-    "font.size": 11,
-    "lines.linewidth": 1.8,
-    "axes.titlesize": 13,
-    "axes.labelsize": 12
-})
+def get_json(url, timeout=2.0):
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-# ---------- helpers ----------
+def poll_ports(base):
+    # Expected endpoints:
+    #  - our controller:  <base>stats/ports
+    # Returns either:
+    #  A) dict: { "1": [ {...}, {...} ], "2": [ {...} ] }
+    #  B) list: [ {"dpid":1,"ports":[...]}, {"dpid":2,"ports":[...]} ]
+    return get_json(base + "stats/ports")
 
-TS_RE = re.compile(r"(\d{8}_\d{6})")  # e.g., 20251109_193823
-
-def _extract_ts(path: str):
-    """Extract sortable timestamp from filename; fall back to mtime."""
-    m = TS_RE.search(os.path.basename(path))
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
-        except Exception:
-            pass
-    # fallback: file modification time
-    return datetime.fromtimestamp(os.path.getmtime(path))
-
-def pick_latest(files):
-    """Return the single newest file from a list (or [] if none)."""
-    files = [f for f in files if os.path.isfile(f)]
-    if not files:
-        return []
-    files.sort(key=_extract_ts)
-    return [files[-1]]
-
-def classify_files(file_list):
-    """Split into baseline vs rl lists by filename prefix."""
-    base, rl = [], []
-    for f in file_list:
-        name = os.path.basename(f)
-        if name.startswith("ports_baseline_"):
-            base.append(f)
-        elif name.startswith("ports_rl_"):
-            rl.append(f)
-    return base, rl
-
-def load_csv(file_path):
-    """Load and preprocess the CSV file (normalize ts to start at 0)."""
-    df = pd.read_csv(file_path)
-    if 'ts' not in df.columns:
-        raise ValueError(f"Missing 'ts' column in {file_path}")
-    df = df.sort_values('ts').reset_index(drop=True)
-    df['ts'] = df['ts'] - df['ts'].iloc[0]
-    return df
-
-def aggregate_metrics(df):
+def iter_port_entries(data):
     """
-    Aggregate all ports to get system-level averages per timestamp.
-    Supports either:
-      - tx_bps/rx_bps (+ drop_ps/err_ps), or
-      - tx_mbps/rx_mbps (+ drop_ps/err_ps)
+    Yields tuples (dpid, entry_dict) across the supported response shapes.
+    Each entry_dict should already look like Ryu's port stats dict
+    (rx_packets, tx_packets, rx_bytes, tx_bytes, rx_dropped, tx_dropped, rx_errors, tx_errors, port_no, ...)
     """
-    cols = set(df.columns)
+    if isinstance(data, dict):
+        # shape A: {"1":[...], "2":[...]}
+        for dpid_str, entries in data.items():
+            try:
+                dpid = int(dpid_str)
+            except Exception:
+                dpid = dpid_str
+            for ent in entries or []:
+                yield dpid, ent
+        return
 
-    # Throughput
-    if {'tx_bps', 'rx_bps'}.issubset(cols):
-        thr_mbps = (df.groupby('ts')['tx_bps'].mean() / 1e6).rename('throughput_mbps')
-    elif {'tx_mbps', 'rx_mbps'}.issubset(cols):
-        thr_mbps = df.groupby('ts')['tx_mbps'].mean().rename('throughput_mbps')
-    else:
-        raise ValueError("CSV must have either tx_bps/rx_bps or tx_mbps/rx_mbps")
+    if isinstance(data, list):
+        # shape B: [{"dpid":1, "<k>":[...]}, ...] ; <k> can be ports/stats/entries depending on controller
+        for block in data:
+            if not isinstance(block, dict):
+                continue
+            dpid = block.get("dpid")
+            # try common container keys
+            for key in ("ports", "stats", "entries"):
+                if key in block and isinstance(block[key], list):
+                    for ent in block[key]:
+                        yield dpid, ent
+                    break
+        return
 
-    # Drops / Errors (packets per second). If missing, default to 0.
-    if 'drop_ps' in cols:
-        drops = df.groupby('ts')['drop_ps'].mean().rename('drops')
-    else:
-        drops = df.groupby('ts').size().mul(0.0).rename('drops')  # zeros
+    # Unknown shape: do nothing
+    return
 
-    if 'err_ps' in cols:
-        errs = df.groupby('ts')['err_ps'].mean().rename('errors')
-    else:
-        errs = df.groupby('ts').size().mul(0.0).rename('errors')  # zeros
-
-    out = pd.concat([thr_mbps, drops, errs], axis=1).reset_index()
-    return out
-
-def plot_metric(ax, df, label, field, ylabel):
-    ax.plot(df['ts'], df[field], label=label)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel(ylabel)
-    ax.legend(loc="upper right")
-
-# ---------- main ----------
+def row_from_entry(ts, dpid, port, ent):
+    # default-get avoids KeyError when the controller omits derived fields
+    return [
+        ts,
+        dpid,
+        port,
+        ent.get("rx_packets", 0),
+        ent.get("tx_packets", 0),
+        ent.get("rx_bytes", 0),
+        ent.get("tx_bytes", 0),
+        ent.get("rx_dropped", 0),
+        ent.get("tx_dropped", 0),
+        ent.get("rx_errors", 0),
+        ent.get("tx_errors", 0),
+        ent.get("rx_rate_bps", 0.0),
+        ent.get("tx_rate_bps", 0.0),
+        ent.get("rx_rate_mbps", 0.0),
+        ent.get("tx_rate_mbps", 0.0),
+        ent.get("loss_pct", 0.0),
+        ent.get("err_pct", 0.0),
+    ]
 
 def main():
-    ap = argparse.ArgumentParser(description="Plot performance graphs from metrics CSVs")
-    ap.add_argument("--files", nargs="+", required=True,
-                    help="List of CSV files (you can pass many; we auto-pick newest baseline and newest RL).")
-    ap.add_argument("--labels", nargs="+", required=False,
-                    help="Optional labels. If exactly two are provided, they map to newest Baseline and newest RL.")
-    ap.add_argument("--out", default=None, help="Output folder (default: docs/baseline/plots/)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--controller", default="http://127.0.0.1:8080/api/v1",
+                    help="Controller REST base, e.g. http://127.0.0.1:8080/api/v1 or 127.0.0.1:8080")
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--duration", type=int, default=120)
+    ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    out_dir = args.out or "docs/baseline/plots"
-    os.makedirs(out_dir, exist_ok=True)
+    base = norm_base(args.controller)
 
-    # Classify and pick the newest baseline & RL (prevents legend explosion)
-    base_files, rl_files = classify_files(args.files)
+    header = [
+        "ts","dpid","port","rx_packets","tx_packets","rx_bytes","tx_bytes",
+        "rx_dropped","tx_dropped","rx_errors","tx_errors",
+        "rx_rate_bps","tx_rate_bps","rx_rate_mbps","tx_rate_mbps",
+        "loss_pct","err_pct"
+    ]
 
-    if args.labels and len(args.labels) == 2:
-        # Explicit Baseline/RL labelling — pick only the newest of each
-        base_files = pick_latest(base_files)
-        rl_files = pick_latest(rl_files)
-        files = base_files + rl_files
-        labels = args.labels
-    else:
-        # No/other labels — still reduce to newest baseline+RL if multiple
-        base_files = pick_latest(base_files) if len(base_files) > 1 else base_files
-        rl_files = pick_latest(rl_files) if len(rl_files) > 1 else rl_files
-        files = base_files + rl_files
-        # Default labels: Baseline / RL (only for files we actually have)
-        labels = []
-        if base_files:
-            labels.append("Baseline")
-        if rl_files:
-            labels.append("RL")
+    start = time.time()
+    next_poll = start
+    end = start + args.duration
 
-    if not files:
-        raise SystemExit("[x] No valid CSVs found among the provided --files")
+    with open(args.out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        while time.time() < end:
+            now = time.time()
+            if now < next_poll:
+                time.sleep(max(0.0, next_poll - now))
+            next_poll += args.interval
+            ts = time.time()
+            try:
+                data = poll_ports(base)
+            except Exception as e:
+                print(f"Fetch error: {e}", file=sys.stdout, flush=True)
+                continue
 
-    # Plot containers
-    fig1, ax1 = plt.subplots()
-    fig2, ax2 = plt.subplots()
-    fig3, ax3 = plt.subplots()
+            wrote_any = False
+            for dpid, ent in iter_port_entries(data):
+                port = ent.get("port_no", 0)
+                # skip LOCAL or bad ports
+                if isinstance(port, str):
+                    if port.upper() == "LOCAL":
+                        continue
+                    try:
+                        port = int(port)
+                    except Exception:
+                        continue
+                elif not isinstance(port, int):
+                    continue
 
-    for i, file in enumerate(files):
-        try:
-            df = load_csv(file)
-            agg = aggregate_metrics(df)
-            label = labels[i] if i < len(labels) else os.path.basename(file)
-            plot_metric(ax1, agg, label, "throughput_mbps", "Avg Throughput (Mbps)")
-            plot_metric(ax2, agg, label, "Packet Drops (pkts/s)")
-            plot_metric(ax3, agg, label, "Packet Errors (pkts/s)")
-        except Exception as e:
-            print(f"[!] Error processing {file}: {e}")
+                w.writerow(row_from_entry(ts, dpid, port, ent))
+                wrote_any = True
 
-    # Save
-    for fig, name in zip([fig1, fig2, fig3],
-                         ["throughput.png", "drops.png", "errors.png"]):
-        out_path = os.path.join(out_dir, name)
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=200)
-        print(f"[✓] Saved {out_path}")
-
-    print(f"\nPlots saved in {os.path.abspath(out_dir)}")
+            # If the shape was totally unknown, don't crash—just report once.
+            if not wrote_any and isinstance(data, (dict, list)):
+                # likely all entries were LOCAL or empty; that's fine
+                pass
+        f.flush()
 
 if __name__ == "__main__":
     main()
