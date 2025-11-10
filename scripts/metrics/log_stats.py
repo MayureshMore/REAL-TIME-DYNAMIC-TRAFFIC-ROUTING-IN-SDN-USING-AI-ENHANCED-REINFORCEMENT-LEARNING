@@ -1,67 +1,113 @@
 #!/usr/bin/env python3
-# Poll controller REST endpoints and write CSV with counters AND per-second rates.
-# Supports a fixed --duration to auto-stop.
+import argparse, time, sys, csv, requests
+from urllib.parse import urlparse
 
-import argparse, csv, time, requests, os
-from datetime import datetime
+def norm_base(u: str) -> str:
+    """
+    Accept either a full base (e.g., http://127.0.0.1:8080/api/v1)
+    or just host[:port] (e.g., 127.0.0.1:8080). Returns a normalized
+    base like 'http://127.0.0.1:8080/api/v1/'.
+    """
+    u = (u or "").strip()
+    if not u:
+        return "http://127.0.0.1:8080/api/v1/"
+    # If user passed just host[:port] without scheme
+    if "://" not in u:
+        u = f"http://{u}"
+    parsed = urlparse(u)
+    # If path is empty, assume /api/v1
+    path = parsed.path or "/api/v1"
+    if not path.endswith("/"):
+        path = path + "/"
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
 
-def fetch_json(url, timeout=3): r = requests.get(url, timeout=timeout); r.raise_for_status(); return r.json()
-def ensure_dir(path: str): os.makedirs(os.path.dirname(path), exist_ok=True)
+def get_json(url, timeout=2.0):
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def poll_ports(base):
+    # ryu rest stats: /stats/ports
+    return get_json(base + "stats/ports")
+
+def row_from_entry(ts, dpid, port, ent):
+    return [
+        ts,
+        dpid,
+        port,
+        ent.get("rx_packets", 0),
+        ent.get("tx_packets", 0),
+        ent.get("rx_bytes", 0),
+        ent.get("tx_bytes", 0),
+        ent.get("rx_dropped", 0),
+        ent.get("tx_dropped", 0),
+        ent.get("rx_errors", 0),
+        ent.get("tx_errors", 0),
+        ent.get("rx_rate_bps", 0.0),
+        ent.get("tx_rate_bps", 0.0),
+        ent.get("rx_rate_mbps", 0.0),
+        ent.get("tx_rate_mbps", 0.0),
+        ent.get("loss_pct", 0.0),
+        ent.get("err_pct", 0.0),
+    ]
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--controller', default='127.0.0.1'); p.add_argument('--port', type=int, default=8080)
-    p.add_argument('--interval', type=float, default=2.0); p.add_argument('--duration', type=float, default=None)
-    p.add_argument('--out', default=None, help='CSV path (default: docs/baseline/metrics_<ts>.csv)')
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--controller", default="http://127.0.0.1:8080/api/v1",
+                    help="Controller REST base. Either full base (http://host:port/api/v1) or host[:port]")
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--duration", type=int, default=120)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
 
-    base = f"http://{args.controller}:{args.port}/api/v1"
-    out = args.out or os.path.join("docs", "baseline", f"metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-    ensure_dir(out)
+    base = norm_base(args.controller)
 
-    fields = ['ts','dpid','port_no','rx_bytes','tx_bytes','rx_pkts','tx_pkts','rx_dropped','tx_dropped','rx_errors','tx_errors',
-              'rx_bps','tx_bps','rx_pps','tx_pps','drop_ps','err_ps']
-    prev = {}  # (dpid,port) -> dict(stats)+ts
+    # CSV header
+    header = [
+        "ts","dpid","port","rx_packets","tx_packets","rx_bytes","tx_bytes",
+        "rx_dropped","tx_dropped","rx_errors","tx_errors",
+        "rx_rate_bps","tx_rate_bps","rx_rate_mbps","tx_rate_mbps",
+        "loss_pct","err_pct"
+    ]
 
-    print(f"Logging to {out}; polling {base} every {args.interval}s; duration={args.duration or '∞'}")
     start = time.time()
-    with open(out, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
-        while True:
+    next_poll = start
+    end = start + args.duration
+
+    with open(args.out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        while time.time() < end:
             now = time.time()
-            try: ports = fetch_json(f"{base}/stats/ports")
-            except Exception as e: print("Fetch error:", e); time.sleep(args.interval); continue
+            if now < next_poll:
+                time.sleep(max(0.0, next_poll - now))
+            next_poll += args.interval
+            ts = time.time()
+            try:
+                data = poll_ports(base)
+            except Exception as e:
+                # Write nothing but keep going; stdout keeps the error trace minimal
+                print(f"Fetch error: {e}", file=sys.stdout, flush=True)
+                continue
 
-            for pstat in ports:
-                key = (pstat.get('dpid'), pstat.get('port_no'))
-                ts_prev = prev.get(key, {}).get('ts', now)
-                dt = max(1e-6, now - ts_prev)
-                rxB_prev = prev.get(key, {}).get('rx_bytes', 0); txB_prev = prev.get(key, {}).get('tx_bytes', 0)
-                rxP_prev = prev.get(key, {}).get('rx_pkts', 0);  txP_prev = prev.get(key, {}).get('tx_pkts', 0)
-                dr_prev  = prev.get(key, {}).get('rx_dropped', 0) + prev.get(key, {}).get('tx_dropped', 0)
-                er_prev  = prev.get(key, {}).get('rx_errors', 0)  + prev.get(key, {}).get('tx_errors', 0)
+            # data shape from /stats/ports: { "DPID": [ { "port_no":..., "rx_packets":..., ...}, ... ], ... }
+            for dpid_str, entries in data.items():
+                try:
+                    dpid = int(dpid_str)
+                except Exception:
+                    # sometimes dpids come as ints already
+                    dpid = dpid_str
+                for ent in entries:
+                    port = ent.get("port_no", 0)
+                    # skip 'LOCAL' and invalids if present
+                    if isinstance(port, str) and port.upper() == "LOCAL":
+                        continue
+                    try:
+                        port = int(port)
+                    except Exception:
+                        continue
+                    w.writerow(row_from_entry(ts, dpid, port, ent))
+        f.flush()
 
-                rxB = pstat.get('rx_bytes', 0); txB = pstat.get('tx_bytes', 0)
-                rxP = pstat.get('rx_pkts', 0);  txP = pstat.get('tx_pkts', 0)
-                dr  = pstat.get('rx_dropped', 0) + pstat.get('tx_dropped', 0)
-                er  = pstat.get('rx_errors', 0)  + pstat.get('tx_errors', 0)
-
-                w.writerow({
-                    'ts': now, 'dpid': pstat.get('dpid'), 'port_no': pstat.get('port_no'),
-                    'rx_bytes': rxB, 'tx_bytes': txB, 'rx_pkts': rxP, 'tx_pkts': txP,
-                    'rx_dropped': pstat.get('rx_dropped', 0), 'tx_dropped': pstat.get('tx_dropped', 0),
-                    'rx_errors': pstat.get('rx_errors', 0), 'tx_errors': pstat.get('tx_errors', 0),
-                    'rx_bps': max(0.0, (rxB - rxB_prev) * 8.0 / dt),
-                    'tx_bps': max(0.0, (txB - txB_prev) * 8.0 / dt),
-                    'rx_pps': max(0.0, (rxP - rxP_prev) / dt),
-                    'tx_pps': max(0.0, (txP - txP_prev) / dt),
-                    'drop_ps': max(0.0, (dr  - dr_prev) / dt),
-                    'err_ps':  max(0.0, (er  - er_prev) / dt),
-                })
-                prev[key] = dict(pstat, ts=now)
-
-            f.flush()
-            if args.duration is not None and (now - start) >= args.duration: print("Duration reached; exiting."); break
-            time.sleep(args.interval)
-
-if __name__ == '__main__': main()
+if __name__ == "__main__":
+    main()
