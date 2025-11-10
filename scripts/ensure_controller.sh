@@ -3,12 +3,22 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYENV_ROOT="${HOME}/.pyenv"
-RYU_BIN="${PYENV_ROOT}/versions/ryu39/bin/ryu-manager"
 LOG="${HOME}/ryu-controller.log"
 OF_PORT="${1:-6633}"
 WSAPI_PORT="${2:-8080}"
 TMUX_SOCKET="-L ryu"
 SESSION="ryu-app"
+
+# Resolve ryu-manager (prefer pyenv, fall back to PATH)
+RYU_BIN="${PYENV_ROOT}/versions/ryu39/bin/ryu-manager"
+if [ ! -x "${RYU_BIN}" ]; then
+  if command -v ryu-manager >/dev/null 2>&1; then
+    RYU_BIN="$(command -v ryu-manager)"
+  else
+    echo "[x] ryu-manager not found. Install Ryu or ensure pyenv ryu39 exists." >&2
+    exit 1
+  fi
+fi
 
 tmux ${TMUX_SOCKET} kill-session -t "${SESSION}" 2>/dev/null || true
 

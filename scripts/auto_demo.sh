@@ -12,7 +12,8 @@ BASELINE_DURATION="${BASELINE_DURATION:-120}"
 RL_DURATION="${RL_DURATION:-120}"
 EPSILON="${EPSILON:-0.2}"
 K="${K:-2}"
-PATH_WAIT_SECS="${PATH_WAIT_SECS:-180}"
+# shorter default makes the demo snappier and avoids unnecessary waits
+PATH_WAIT_SECS="${PATH_WAIT_SECS:-30}"
 RL_WATCHDOG_PAD="${RL_WATCHDOG_PAD:-45}"
 
 ENSURE="${REPO}/scripts/ensure_controller.sh"
@@ -32,6 +33,19 @@ need(){ command -v "$1" >/dev/null 2>&1 || { say "[x] missing: $1"; exit 1; }; }
 need curl; need jq; need python3; need sudo
 command -v timeout >/dev/null 2>&1 || true
 
+# portable timeout wrapper
+have_timeout=0
+if command -v timeout >/dev/null 2>&1; then have_timeout=1; fi
+run_timeout() {
+  local secs="$1"; shift
+  if [ "${have_timeout}" -eq 1 ]; then
+    timeout --foreground "${secs}" "$@"
+  else
+    # Best-effort: run in BG and kill after secs
+    ( "$@" & pid=$!; (sleep "${secs}"; kill "${pid}" 2>/dev/null || true) & wait "${pid}" 2>/dev/null || true )
+  fi
+}
+
 kill_stragglers(){
   pkill -f "${TOPO}" >/dev/null 2>&1 || true
   pkill -f "bandit_agent.py" >/dev/null 2>&1 || true
@@ -43,7 +57,7 @@ clean_start(){
   sudo mn -c >/dev/null 2>&1 || true
   sudo pkill -9 -f 'mininet($|:)' >/dev/null 2>&1 || true
   kill_stragglers
-  rm -f /tmp/*.out /tmp/*.err 2>/dev/null || true
+  rm -f /tmp/*.out /tmp/*.err /tmp/*.log 2>/dev/null || true
   say "  Cleanup complete."
 }
 
@@ -59,6 +73,8 @@ sanity_topo(){
   sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${SANITY_SECS}" > /tmp/topo_sanity.out 2>&1 &
   end=$(( $(date +%s) + SANITY_SECS ))
   printed=0
+  # don't let transient jq/curl failures abort us
+  set +e
   while [ "$(date +%s)" -lt "${end}" ]; do
     nodes="$(curl -sf "${API_BASE}/topology/nodes" | jq -c '.' 2>/dev/null || echo '[]')"
     links="$(curl -sf "${API_BASE}/topology/links" | jq -c '.' 2>/dev/null || echo '[]')"
@@ -71,15 +87,19 @@ sanity_topo(){
     fi
     sleep 1
   done
+  set -e
 }
 
 run_baseline(){
   step "3) Baseline run for ${BASELINE_DURATION}s"
   export DURATION="${BASELINE_DURATION}"
+  # make baseline non-fatal: even if it fails, keep going to RL
+  set +e
   BASELINE_CSV=$(
     DURATION="${BASELINE_DURATION}" bash "${RUN_BASELINE}" \
       2>/tmp/baseline.err | tee /tmp/baseline.out | awk '/CSV: /{print $NF}' | tail -n1
   )
+  set -e
   BASELINE_CSV="${BASELINE_CSV:-}"
   if [ -z "${BASELINE_CSV}" ]; then
     say "  [!] Could not detect baseline CSV path. Check /tmp/baseline.err"
@@ -88,13 +108,15 @@ run_baseline(){
   fi
 
   say
-  say "  Live peek: ${BASELINE_CSV} (every 10s for 60s)"
+  say "  Live peek: ${BASELINE_CSV:-<unknown>} (every 10s for 60s)"
   for _ in {1..6}; do
-    if [ -f "${BASELINE_CSV}" ]; then
-      tail -n 12 "${BASELINE_CSV}" | sed 's/[[:space:]]\+$//' | indent
+    set +e
+    if [ -n "${BASELINE_CSV}" ] && [ -f "${BASELINE_CSV}" ]; then
+      tail -n 12 "${BASELINE_CSV}" | sed 's/[[:space:]]\+$//' | indent || true
     else
       say "  (waiting for first samples...)"
     fi
+    set -e
     sleep 10
   done
 }
@@ -113,9 +135,9 @@ run_rl(){
   sudo -E python3 "${TOPO}" --controller_ip "${CTRL_HOST}" --no_cli --duration "${topo_secs}" > /tmp/topo_rl.out 2>&1 &
   local topo_pid=$!
 
-  export CTRL_HOST WSAPI_PORT DURATION RL_DURATION EPSILON K
+  export CTRL_HOST WSAPI_PORT DURATION RL_DURATION EPSILON K PATH_WAIT_SECS
   set +e
-  timeout --foreground $(( RL_DURATION + RL_WATCHDOG_PAD )) \
+  run_timeout $(( RL_DURATION + RL_WATCHDOG_PAD )) \
     bash "${RUN_RL}" 2>/tmp/rl.err | tee /tmp/rl.out
   RL_STATUS=$?
   set -e
@@ -138,11 +160,13 @@ run_rl(){
   say
   say "  Live peek: ${RL_CSV:-<unknown>} (every 10s for 60s)"
   for _ in {1..6}; do
+    set +e
     if [ -n "${RL_CSV}" ] && [ -f "${RL_CSV}" ]; then
-      tail -n 12 "${RL_CSV}" | sed 's/[[:space:]]\+$//' | indent
+      tail -n 12 "${RL_CSV}" | sed 's/[[:space:]]\+$//' | indent || true
     else
       say "  (waiting for first samples...)"
     fi
+    set -e
     sleep 10
   done
 

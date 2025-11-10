@@ -10,7 +10,7 @@ CTRL_HOST="${CTRL_HOST:-127.0.0.1}"
 DURATION="${DURATION:-120}"
 EPSILON="${EPSILON:-0.2}"
 K="${K:-2}"
-PATH_WAIT_SECS="${PATH_WAIT_SECS:-180}"
+PATH_WAIT_SECS="${PATH_WAIT_SECS:-30}"
 REUSE_TOPOLOGY="${REUSE_TOPOLOGY:-0}"
 
 API_BASE="http://${CTRL_HOST}:${WSAPI_PORT}/api/v1"
@@ -23,11 +23,11 @@ CSV_DIR="${REPO}/docs/baseline"
 
 indent(){ sed 's/^/  /'; }
 say(){ printf "%s\n" "$*"; }
-
 need(){ command -v "$1" >/dev/null 2>&1 || { echo "[x] missing $1"; exit 1; }; }
+
 need curl; need jq; need python3; need sudo
 
-# Controller up
+# Ensure controller
 if ! curl -sf "${API_BASE}/health" >/dev/null 2>&1; then
   say "[ctrl] controller not healthy; starting via ensure_controller.sh"
   WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT}" "${ENSURE}" "${OF_PORT}" "${WSAPI_PORT}" | indent
@@ -41,7 +41,7 @@ if [ "${REUSE_TOPOLOGY}" != "1" ]; then
   topo_pid="$!"
 fi
 
-# Wait for two hosts
+# Wait for two hosts (robust: ignore transient REST hiccups)
 deadline=$(( $(date +%s) + PATH_WAIT_SECS ))
 H1=""; H2=""
 while [ "$(date +%s)" -lt "${deadline}" ]; do
@@ -58,17 +58,17 @@ if [ -z "${H1}" ] || [ -z "${H2}" ]; then
 fi
 say "[wait] hosts learned H1=${H1} H2=${H2}"
 
-# Warm k-paths both ways
+# Warm k paths both ways
 curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null || true
 curl -sf "${API_BASE}/paths?src_mac=${H2}&dst_mac=${H1}&k=${K}" >/dev/null || true
 
-# Start logger
+# Logger
 CSV="${CSV_DIR}/ports_rl_$(date +%Y%m%d_%H%M%S).csv"
 say "[log] ${CSV}"
 python3 "${LOGGER}" --controller "${API_BASE}" --interval 1 --duration "${DURATION}" --out "${CSV}" > /tmp/logger.out 2>&1 &
 LOGGER_PID=$!
 
-# Run agent (foreground)
+# Agent
 say "[agent] epsilon=${EPSILON} k=${K}"
 python3 "${AGENT}" --controller "${API_BASE}" --epsilon "${EPSILON}" --k "${K}" --src "${H1}" --dst "${H2}" > /tmp/agent.out 2>&1 || true
 
@@ -79,10 +79,14 @@ wait "${LOGGER_PID}" 2>/dev/null || true
 # Summary
 if [ -s "${CSV}" ]; then
   say "CSV: ${CSV}"
+  # surface Q/plays if present
+  echo "[agent] summary:"; grep -Eo '\{"q":[^}]+}' /tmp/agent.out | tail -n1 || true
 else
   say "[!] RL CSV empty or missing: ${CSV}"
   tail -n 80 /tmp/logger.out || true
   tail -n 80 /tmp/agent.out || true
+  # leave topo running for inspection if REUSE_TOPOLOGY=1; otherwise we’ll still clean it
+  [ -n "${topo_pid}" ] && kill "${topo_pid}" 2>/dev/null || true
   exit 1
 fi
 
