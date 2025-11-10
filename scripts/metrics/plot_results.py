@@ -1,105 +1,103 @@
 #!/usr/bin/env python3
-import argparse, math
+import argparse, os
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # headless and reliable
 import matplotlib.pyplot as plt
-from pathlib import Path
+from typing import List
 
-# ---- Tunables ----
-USE_CORE_SUM = False      # False => use host-facing ports (recommended); True => sum core links (ports 2 & 3)
-LOG_SCALE_SMALL = True    # Use log scale for drops/errors so near-zero values are visible
-
-def load_and_prepare(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    # Basic sanity
-    needed = {'ts','dpid','port','rx_rate_mbps','tx_rate_mbps','loss_pct','err_pct'}
-    missing = needed - set(df.columns)
+def read_one(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    needed = {
+        "ts","dpid","port","rx_packets","tx_packets","rx_bytes","tx_bytes",
+        "rx_dropped","tx_dropped","rx_errors","tx_errors",
+        "rx_rate_bps","tx_rate_bps","rx_rate_mbps","tx_rate_mbps",
+        "loss_pct","err_pct"
+    }
+    missing = [c for c in needed if c not in df.columns]
     if missing:
-        raise RuntimeError(f"{csv_path}: missing columns {missing}")
+        raise ValueError(f"{os.path.basename(path)} missing columns: {missing}")
+    # drop LOCAL port
+    df = df[df["port"] != 4294967294].copy()
+    # second resolution index
+    df["t"] = df["ts"].round().astype("int64")
+    return df
 
-    # Filter out LOCAL pseudo-port
-    df = df[df['port'] != 4294967294].copy()
+def e2e_series(df: pd.DataFrame) -> pd.Series:
+    """End-to-end Mbps per second between host ports: min(s1:port1 tx, s2:port1 rx)."""
+    host = df[df["port"] == 1].copy()
+    if host.empty:
+        return pd.Series(dtype=float)
+    s1_tx = host[host["dpid"] == 1].groupby("t")["tx_rate_mbps"].mean()
+    s2_rx = host[host["dpid"] == 2].groupby("t")["rx_rate_mbps"].mean()
+    aligned = pd.concat([s1_tx, s2_rx], axis=1, join="inner")
+    aligned.columns = ["tx_mbps", "rx_mbps"]
+    return aligned.min(axis=1)
 
-    # Round timestamps to 1s buckets for alignment
-    df['t'] = df['ts'].round().astype(int)
+def drops_series(df: pd.DataFrame) -> pd.Series:
+    """Sum drops (rx_dropped + tx_dropped) across all non-LOCAL ports per second (packets/sec)."""
+    g = df.groupby("t")[["rx_dropped","tx_dropped"]].sum()
+    return (g["rx_dropped"] + g["tx_dropped"]).astype(float)
 
-    if USE_CORE_SUM:
-        # Sum throughput across inter-switch links (ports 2 and 3), per second
-        core = df[df['port'].isin([2,3])].copy()
-        # Use TX as "outgoing capacity" proxy
-        thr = core.groupby('t')['tx_rate_mbps'].sum().rename('throughput_mbps')
-    else:
-        # Use host-facing ports (port==1): s1:1 TX (sender) + s2:1 RX (receiver)
-        host = df[df['port'] == 1].copy()
-        s1_tx = host[host['dpid'] == 1].groupby('t')['tx_rate_mbps'].mean()
-        s2_rx = host[host['dpid'] == 2].groupby('t')['rx_rate_mbps'].mean()
-        # Align and take the min per second (conservative e2e)
-        thr = pd.concat([s1_tx, s2_rx], axis=1, join='inner')
-        thr.columns = ['tx_mbps','rx_mbps']
-        thr['throughput_mbps'] = thr[['tx_mbps','rx_mbps']].min(axis=1)
-        thr = thr['throughput_mbps']
+def errors_series(df: pd.DataFrame) -> pd.Series:
+    """Sum errors across all non-LOCAL ports per second (packets/sec)."""
+    g = df.groupby("t")[["rx_errors","tx_errors"]].sum()
+    return (g["rx_errors"] + g["tx_errors"]).astype(float)
 
-    # For drops/errors, take mean across all ports per second to avoid a single quiet port masking activity
-    loss = df.groupby('t')['loss_pct'].mean().rename('loss_pct_mean')
-    errs = df.groupby('t')['err_pct'].mean().rename('err_pct_mean')
-
-    out = pd.concat([thr, loss, errs], axis=1)
-    out.index.name = 't'
-    return out
+def plot_timeseries(ax, series_list: List[pd.Series], labels: List[str], title: str, ylabel: str):
+    for s, lab in zip(series_list, labels):
+        if s.empty:
+            ax.plot([], [], label=f"{lab} (no data)")
+        else:
+            ax.plot(s.index - s.index.min(), s.values, label=lab)  # normalize time to start at 0
+    ax.set_title(title)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(ylabel)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--files', nargs='+', required=True, help='CSV files: baseline then RL')
-    ap.add_argument('--labels', nargs='+', required=True, help='Matching labels')
+    ap.add_argument("--files", nargs="+", required=True, help="CSV files (baseline then RL)")
+    ap.add_argument("--labels", nargs="+", required=True, help="Labels matching files")
     args = ap.parse_args()
 
     if len(args.files) != len(args.labels):
-        raise SystemExit('Need same number of --files and --labels')
+        raise SystemExit("files and labels must be the same length")
 
-    series = []
-    for f in args.files:
-        series.append(load_and_prepare(Path(f)))
+    dfs = [read_one(p) for p in args.files]
+    labels = args.labels
 
-    # Align all runs on a common time index
-    common_t = series[0].index
-    for s in series[1:]:
-        common_t = common_t.intersection(s.index)
-    runs = [s.loc[common_t] for s in series]
+    # Compute series
+    thr = [e2e_series(df) for df in dfs]
+    drp = [drops_series(df) for df in dfs]
+    err = [errors_series(df) for df in dfs]
 
-    # ---- Throughput ----
-    plt.figure(figsize=(12,6))
-    for s, lab in zip(runs, args.labels):
-        plt.plot(common_t - common_t.min(), s['throughput_mbps'], label=lab, linewidth=1.5)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Throughput (Mbps)')
-    plt.legend()
-    out_dir = Path(args.files[0]).parent / 'plots'
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / 'throughput.png').write_bytes(plt.gcf().canvas.buffer_rgba())
-    plt.savefig(out_dir / 'throughput.png', bbox_inches='tight', dpi=150)
+    # Output dir: sibling 'plots' of first csv parent
+    first_dir = os.path.dirname(os.path.abspath(args.files[0]))
+    out_dir = os.path.join(first_dir, "plots")
+    os.makedirs(out_dir, exist_ok=True)
 
-    # ---- Drops ----
-    plt.figure(figsize=(12,6))
-    for s, lab in zip(runs, args.labels):
-        y = s['loss_pct_mean']
-        plt.plot(common_t - common_t.min(), y, label=lab, linewidth=1.5)
-    if LOG_SCALE_SMALL:
-        plt.yscale('symlog', linthresh=1e-4)  # show tiny values
-    plt.xlabel('Time (s)')
-    plt.ylabel('Packet Drops (fraction)')
-    plt.legend()
-    plt.savefig(out_dir / 'drops.png', bbox_inches='tight', dpi=150)
+    # Throughput
+    fig, ax = plt.subplots(figsize=(12, 7))
+    plot_timeseries(ax, thr, labels, "Throughput (end-to-end, host ports)", "Throughput (Mbps)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "throughput.png"), dpi=160)
+    plt.close(fig)
 
-    # ---- Errors ----
-    plt.figure(figsize=(12,6))
-    for s, lab in zip(runs, args.labels):
-        y = s['err_pct_mean']
-        plt.plot(common_t - common_t.min(), y, label=lab, linewidth=1.5)
-    if LOG_SCALE_SMALL:
-        plt.yscale('symlog', linthresh=1e-5)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Packet Errors (fraction)')
-    plt.legend()
-    plt.savefig(out_dir / 'errors.png', bbox_inches='tight', dpi=150)
+    # Drops
+    fig, ax = plt.subplots(figsize=(12, 7))
+    plot_timeseries(ax, drp, labels, "Packet Drops (all non-LOCAL ports)", "Packet Drops (pkts/s)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "drops.png"), dpi=160)
+    plt.close(fig)
 
-if __name__ == '__main__':
+    # Errors
+    fig, ax = plt.subplots(figsize=(12, 7))
+    plot_timeseries(ax, err, labels, "Packet Errors (all non-LOCAL ports)", "Packet Errors (pkts/s)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "errors.png"), dpi=160)
+    plt.close(fig)
+
+if __name__ == "__main__":
     main()
