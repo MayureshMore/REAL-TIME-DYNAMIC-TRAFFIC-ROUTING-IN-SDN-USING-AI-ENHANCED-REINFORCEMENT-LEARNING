@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # Plot Results for SDN RL Experiments
-# -----------------------------------
-# Reads port metrics CSV logs and plots average throughput, drop rate,
-# and error rate over time. Outputs graphs under docs/baseline/plots/.
+# Reads port CSVs and plots total throughput (Mbps), drops (pkts/s), errors (pkts/s).
+# Works whether the CSV already includes rates or only counters.
 
-import argparse
-import os
-import re
-import glob
+import argparse, os, re
 from datetime import datetime
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -21,33 +17,26 @@ plt.rcParams.update({
     "axes.labelsize": 12
 })
 
-# ---------- helpers ----------
-
 TS_RE = re.compile(r"(\d{8}_\d{6})")  # e.g., 20251109_193823
 
-def _extract_ts(path: str):
-    """Extract sortable timestamp from filename; fall back to mtime."""
+def _extract_ts_from_name(path: str):
     m = TS_RE.search(os.path.basename(path))
     if m:
         try:
             return datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
         except Exception:
             pass
-    # fallback: file modification time
     return datetime.fromtimestamp(os.path.getmtime(path))
 
-def pick_latest(files):
-    """Return the single newest file from a list (or [] if none)."""
-    files = [f for f in files if os.path.isfile(f)]
-    if not files:
+def pick_latest(paths):
+    paths = [p for p in paths if os.path.isfile(p)]
+    if not paths:
         return []
-    files.sort(key=_extract_ts)
-    return [files[-1]]
+    return [sorted(paths, key=_extract_ts_from_name)[-1]]
 
-def classify_files(file_list):
-    """Split into baseline vs rl lists by filename prefix."""
+def classify(files):
     base, rl = [], []
-    for f in file_list:
+    for f in files:
         name = os.path.basename(f)
         if name.startswith("ports_baseline_"):
             base.append(f)
@@ -55,115 +44,115 @@ def classify_files(file_list):
             rl.append(f)
     return base, rl
 
-def load_csv(file_path):
-    """Load and preprocess the CSV file (normalize ts to start at 0)."""
-    df = pd.read_csv(file_path)
-    if 'ts' not in df.columns:
-        raise ValueError(f"Missing 'ts' column in {file_path}")
-    df = df.sort_values('ts').reset_index(drop=True)
-    df['ts'] = df['ts'] - df['ts'].iloc[0]
+def load_csv(path):
+    df = pd.read_csv(path)
+    if "ts" not in df.columns:
+        raise ValueError(f"{path}: missing ts")
+    # Normalize time to start at 0 per file
+    df = df.sort_values("ts").reset_index(drop=True)
+    df["ts"] = df["ts"] - df["ts"].iloc[0]
     return df
 
-def aggregate_metrics(df):
-    """
-    Aggregate all ports to get system-level averages per timestamp.
-    Supports either:
-      - tx_bps/rx_bps (+ drop_ps/err_ps), or
-      - tx_mbps/rx_mbps (+ drop_ps/err_ps)
-    """
+def derive_rates_if_needed(df):
     cols = set(df.columns)
+    # If rate columns already present and non-zero sometimes, keep them
+    if {"tx_rate_bps", "rx_rate_bps"}.issubset(cols) and df["tx_rate_bps"].max() > 0:
+        tx_bps = df.groupby("ts")["tx_rate_bps"].sum()
+        drops  = df.groupby("ts")["drop_ps"].sum() if "drop_ps" in cols else None
+        errs   = df.groupby("ts")["err_ps"].sum() if "err_ps" in cols else None
+        return pd.DataFrame({
+            "ts": tx_bps.index,
+            "throughput_mbps": tx_bps.values / 1e6,
+            "drops": (drops.values if drops is not None else 0),
+            "errors": (errs.values if errs is not None else 0),
+        })
 
-    # Throughput
-    if {'tx_bps', 'rx_bps'}.issubset(cols):
-        thr_mbps = (df.groupby('ts')['tx_bps'].mean() / 1e6).rename('throughput_mbps')
-    elif {'tx_mbps', 'rx_mbps'}.issubset(cols):
-        thr_mbps = df.groupby('ts')['tx_mbps'].mean().rename('throughput_mbps')
-    else:
-        raise ValueError("CSV must have either tx_bps/rx_bps or tx_mbps/rx_mbps")
+    # Otherwise compute deltas from counters per (dpid,port)
+    need = {"dpid","port","tx_bytes","rx_bytes","rx_dropped","tx_dropped","rx_errors","tx_errors"}
+    if not need.issubset(cols):
+        raise ValueError("CSV lacks needed counters to derive rates.")
 
-    # Drops / Errors (packets per second). If missing, default to 0.
-    if 'drop_ps' in cols:
-        drops = df.groupby('ts')['drop_ps'].mean().rename('drops')
-    else:
-        drops = df.groupby('ts').size().mul(0.0).rename('drops')  # zeros
+    df = df.sort_values(["dpid","port","ts"]).copy()
+    for c in ["tx_bytes","rx_bytes","rx_dropped","tx_dropped","rx_errors","tx_errors"]:
+        df[f"{c}_prev"] = df.groupby(["dpid","port"])[c].shift(1)
+    df["ts_prev"] = df.groupby(["dpid","port"])["ts"].shift(1)
 
-    if 'err_ps' in cols:
-        errs = df.groupby('ts')['err_ps'].mean().rename('errors')
-    else:
-        errs = df.groupby('ts').size().mul(0.0).rename('errors')  # zeros
+    # deltas and dt
+    for c in ["tx_bytes","rx_bytes","rx_dropped","tx_dropped","rx_errors","tx_errors"]:
+        df[f"d_{c}"] = df[c] - df[f"{c}_prev"]
+    df["dt"] = (df["ts"] - df["ts_prev"]).clip(lower=1e-6)
 
-    out = pd.concat([thr_mbps, drops, errs], axis=1).reset_index()
-    return out
+    # per-port rates
+    df["tx_bps"] = (df["d_tx_bytes"].clip(lower=0)) * 8.0 / df["dt"]
+    df["drop_ps"] = ((df["d_rx_dropped"].clip(lower=0)) + (df["d_tx_dropped"].clip(lower=0))) / df["dt"]
+    df["err_ps"]  = ((df["d_rx_errors"].clip(lower=0))  + (df["d_tx_errors"].clip(lower=0)))  / df["dt"]
 
-def plot_metric(ax, df, label, field, ylabel):
-    ax.plot(df['ts'], df[field], label=label)
+    # Aggregate across ports per timestamp
+    agg = df.groupby("ts").agg(
+        throughput_mbps=("tx_bps","sum"),
+        drops=("drop_ps","sum"),
+        errors=("err_ps","sum"),
+    ).reset_index()
+    agg["throughput_mbps"] = agg["throughput_mbps"] / 1e6
+    return agg
+
+def plot_series(ax, agg, label, ylabel):
+    ax.plot(agg["ts"], agg[label], label=ylabel)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(ylabel)
-    ax.legend(loc="upper right")
-
-# ---------- main ----------
 
 def main():
-    ap = argparse.ArgumentParser(description="Plot performance graphs from metrics CSVs")
+    ap = argparse.ArgumentParser(description="Plot Baseline vs RL from port logs")
     ap.add_argument("--files", nargs="+", required=True,
-                    help="List of CSV files (you can pass many; we auto-pick newest baseline and newest RL).")
-    ap.add_argument("--labels", nargs="+", required=False,
-                    help="Optional labels. If exactly two are provided, they map to newest Baseline and newest RL.")
-    ap.add_argument("--out", default=None, help="Output folder (default: docs/baseline/plots/)")
+                    help="CSV list (will auto-pick newest Baseline and newest RL)")
+    ap.add_argument("--labels", nargs="+", help="Two labels for Baseline and RL (optional)")
+    ap.add_argument("--out", default="docs/baseline/plots", help="Output folder")
     args = ap.parse_args()
 
-    out_dir = args.out or "docs/baseline/plots"
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
 
-    # Classify and pick the newest baseline & RL (prevents legend explosion)
-    base_files, rl_files = classify_files(args.files)
-
-    if args.labels and len(args.labels) == 2:
-        # Explicit Baseline/RL labelling — pick only the newest of each
-        base_files = pick_latest(base_files)
-        rl_files = pick_latest(rl_files)
-        files = base_files + rl_files
-        labels = args.labels
-    else:
-        # No/other labels — still reduce to newest baseline+RL if multiple
-        base_files = pick_latest(base_files) if len(base_files) > 1 else base_files
-        rl_files = pick_latest(rl_files) if len(rl_files) > 1 else rl_files
-        files = base_files + rl_files
-        # Default labels: Baseline / RL (only for files we actually have)
-        labels = []
-        if base_files:
-            labels.append("Baseline")
-        if rl_files:
-            labels.append("RL")
+    base, rl = classify(args.files)
+    base = pick_latest(base) if len(base) > 1 else base
+    rl   = pick_latest(rl)   if len(rl)   > 1 else rl
+    files = base + rl
 
     if not files:
-        raise SystemExit("[x] No valid CSVs found among the provided --files")
+        raise SystemExit("[x] No valid input CSVs")
 
-    # Plot containers
-    fig1, ax1 = plt.subplots()
-    fig2, ax2 = plt.subplots()
-    fig3, ax3 = plt.subplots()
+    labels = args.labels if args.labels and len(args.labels) == 2 else None
+    if labels is None:
+        labels = []
+        if base: labels.append("Baseline")
+        if rl:   labels.append("RL")
 
-    for i, file in enumerate(files):
-        try:
-            df = load_csv(file)
-            agg = aggregate_metrics(df)
-            label = labels[i] if i < len(labels) else os.path.basename(file)
-            plot_metric(ax1, agg, label, "throughput_mbps", "Avg Throughput (Mbps)")
-            plot_metric(ax2, agg, label, "Packet Drops (pkts/s)")
-            plot_metric(ax3, agg, label, "Packet Errors (pkts/s)")
-        except Exception as e:
-            print(f"[!] Error processing {file}: {e}")
+    # Create figures
+    fig_t, ax_t = plt.subplots()
+    fig_d, ax_d = plt.subplots()
+    fig_e, ax_e = plt.subplots()
 
-    # Save
-    for fig, name in zip([fig1, fig2, fig3],
-                         ["throughput.png", "drops.png", "errors.png"]):
-        out_path = os.path.join(out_dir, name)
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=200)
-        print(f"[✓] Saved {out_path}")
+    for i, path in enumerate(files):
+        df = load_csv(path)
+        agg = derive_rates_if_needed(df)
+        name = labels[i] if i < len(labels) else os.path.basename(path)
 
-    print(f"\nPlots saved in {os.path.abspath(out_dir)}")
+        ax_t.plot(agg["ts"], agg["throughput_mbps"], label=name)
+        ax_d.plot(agg["ts"], agg["drops"],            label=name)
+        ax_e.plot(agg["ts"], agg["errors"],           label=name)
+
+    for ax, ylab in [(ax_t,"Throughput (Mbps)"),
+                     (ax_d,"Packet Drops (pkts/s)"),
+                     (ax_e,"Packet Errors (pkts/s)")]:
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(ylab)
+        ax.legend(loc="upper right")
+
+    fig_t.tight_layout(); fig_d.tight_layout(); fig_e.tight_layout()
+    fig_t.savefig(os.path.join(args.out,"throughput.png"), dpi=200)
+    fig_d.savefig(os.path.join(args.out,"drops.png"), dpi=200)
+    fig_e.savefig(os.path.join(args.out,"errors.png"), dpi=200)
+    print(f"[✓] Saved {os.path.abspath(args.out)}/throughput.png")
+    print(f"[✓] Saved {os.path.abspath(args.out)}/drops.png")
+    print(f"[✓] Saved {os.path.abspath(args.out)}/errors.png")
 
 if __name__ == "__main__":
     main()

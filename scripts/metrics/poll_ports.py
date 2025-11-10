@@ -1,70 +1,73 @@
 #!/usr/bin/env python3
 # scripts/metrics/poll_ports.py
-#
-# Polls the controller REST API every N seconds and appends CSV rows with
-# per-port counters (dpid,port_no,rx/tx bytes/packets,drops,errors, rates…).
-# Tries a few endpoints to be compatible across controller builds.
+# Polls controller REST and writes per-port counters + derived rates.
 
 import argparse, csv, json, sys, time, urllib.request, urllib.error
-from datetime import datetime
+from urllib.parse import urlparse
+
+LOCAL_PORT = 4294967294
 
 CANDIDATE_ENDPOINTS = [
-    "metrics/ports",   # modern controllers expose metrics endpoint
-    "stats/ports",     # Ryu app in this repo
-    "ports",           # legacy fallback
+    "metrics/ports",   # if available
+    "stats/ports",     # Ryu app (this repo)
+    "ports",           # legacy
 ]
+
+def norm_base(u: str) -> str:
+    u = (u or "").strip()
+    if "://" not in u:
+        u = f"http://{u}"
+    p = urlparse(u)
+    path = p.path or "/api/v1"
+    if not path.endswith("/"):
+        path += "/"
+    return f"{p.scheme}://{p.netloc}{path}"
 
 def get_json(url, timeout=3.0):
     req = urllib.request.Request(url, headers={"Accept":"application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
-def flatten_records(now_ts, payload):
+def flatten(now_ts, payload):
     """
-    Accepts either:
-      [
-        {"dpid":1,"port_no":1,"rx_bytes":...,"tx_bytes":...,"rx_packets":...,"tx_packets":...,
-         "rx_dropped":0,"tx_dropped":0,"rx_errors":0,"tx_errors":0,
-         "rx_rate":0.0,"tx_rate":0.0,"drop_rate":0.0,"err_rate":0.0},
-        ...
-      ]
-    or nested by dpid -> list[ports].
-    Returns list of rows matching the CSV header below.
+    Returns list of normalized dicts:
+      {dpid, port_no, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_dropped, tx_dropped, rx_errors, tx_errors}
     """
     rows = []
-    if isinstance(payload, dict) and "ports" in payload:  # { "ports": [...] }
+    if isinstance(payload, dict) and "ports" in payload:
         payload = payload["ports"]
 
-    if isinstance(payload, dict):
-        # { "1":[{port rec},...], "2":[...], ... }
-        for dpid, plist in payload.items():
+    if isinstance(payload, dict):  # {"1":[...], "2":[...]}
+        for dpid_str, plist in payload.items():
             for p in plist or []:
-                rows.append(row_from_port(now_ts, p, dpid=int(dpid)))
+                r = dict(p)
+                r["dpid"] = int(r.get("dpid", int(dpid_str)))
+                r["port_no"] = int(r.get("port_no", r.get("port", 0)))
+                rows.append(r)
     elif isinstance(payload, list):
-        for p in payload:
-            rows.append(row_from_port(now_ts, p))
+        # Either [{"dpid":1,"ports":[...]}, ...] OR flat list
+        handled = False
+        for block in payload:
+            if not isinstance(block, dict): continue
+            if "ports" in block and isinstance(block["ports"], list):
+                for p in block["ports"]:
+                    r = dict(p)
+                    r["dpid"] = int(r.get("dpid", block.get("dpid", 0)))
+                    r["port_no"] = int(r.get("port_no", r.get("port", 0)))
+                    rows.append(r)
+                handled = True
+        if not handled:
+            for p in payload:
+                if isinstance(p, dict) and ("port_no" in p or "port" in p):
+                    r = dict(p)
+                    r["dpid"] = int(r.get("dpid", 0))
+                    r["port_no"] = int(r.get("port_no", r.get("port", 0)))
+                    rows.append(r)
     return rows
 
-def row_from_port(ts, p, dpid=None):
-    d = {k: p.get(k) for k in p.keys()}
-    dpid = int(d.get("dpid", dpid or 0))
-    port_no = int(d.get("port_no", d.get("port", 0)))
-    rx_bytes = int(d.get("rx_bytes", 0))
-    tx_bytes = int(d.get("tx_bytes", 0))
-    rx_packets = int(d.get("rx_packets", 0))
-    tx_packets = int(d.get("tx_packets", 0))
-    rx_dropped = int(d.get("rx_dropped", 0))
-    tx_dropped = int(d.get("tx_dropped", 0))
-    rx_errors  = int(d.get("rx_errors", 0))
-    tx_errors  = int(d.get("tx_errors", 0))
-    rx_rate = float(d.get("rx_rate", 0.0))
-    tx_rate = float(d.get("tx_rate", 0.0))
-    drop_rate = float(d.get("drop_rate", 0.0))
-    err_rate  = float(d.get("err_rate", 0.0))
-    return [ts, dpid, port_no,
-            rx_bytes, tx_bytes, rx_packets, tx_packets,
-            rx_dropped, tx_dropped, rx_errors, tx_errors,
-            rx_rate, tx_rate, drop_rate, err_rate]
+def safe_int(x, default=0):
+    try: return int(x)
+    except Exception: return default
 
 def main():
     ap = argparse.ArgumentParser()
@@ -75,12 +78,15 @@ def main():
     ap.add_argument("--duration", type=float, default=120.0, help="Total seconds to run")
     args = ap.parse_args()
 
-    header = ["ts","dpid","port_no",
-              "rx_bytes","tx_bytes","rx_packets","tx_packets",
-              "rx_dropped","tx_dropped","rx_errors","tx_errors",
-              "rx_rate","tx_rate","drop_rate","err_rate"]
+    base = norm_base(args.controller)
 
-    # Open in append mode; write header if empty/new.
+    header = ["ts","dpid","port",
+              "rx_packets","tx_packets","rx_bytes","tx_bytes",
+              "rx_dropped","tx_dropped","rx_errors","tx_errors",
+              "rx_rate_bps","tx_rate_bps","rx_rate_mbps","tx_rate_mbps",
+              "drop_ps","err_ps"]
+
+    # open CSV (append) and write header if empty
     try:
         f = open(args.outfile, "a", newline="")
         writer = csv.writer(f)
@@ -90,9 +96,11 @@ def main():
         print(f"[logger] cannot open {args.outfile}: {e}", file=sys.stderr)
         sys.exit(1)
 
+    prev = {}  # (dpid,port) -> {ts, rx_bytes, tx_bytes, rx_drop, tx_drop, rx_err, tx_err}
+
     start = time.time()
     next_tick = start
-    print(f"Logging to {args.outfile}; polling {args.controller} every {args.interval:.1f}s; duration={args.duration:.1f}", file=sys.stderr)
+    print(f"Logging to {args.outfile}; polling {base} every {args.interval:.1f}s; duration={args.duration:.1f}", file=sys.stderr)
     try:
         while True:
             now = time.time()
@@ -101,28 +109,55 @@ def main():
             next_tick += args.interval
 
             ts = now
-            data = None
+            payload = None
             last_err = None
-            base = args.controller.rstrip("/")
             for ep in CANDIDATE_ENDPOINTS:
-                url = f"{base}/{ep.lstrip('/')}"
                 try:
-                    data = get_json(url)
+                    payload = get_json(f"{base}{ep}")
                     break
-                except urllib.error.URLError as e:
-                    last_err = e
                 except Exception as e:
                     last_err = e
-            if data is None:
+            if payload is None:
                 print(f"[logger] poll failed: {last_err}", file=sys.stderr)
             else:
-                rows = flatten_records(ts, data)
-                for r in rows:
-                    writer.writerow(r)
+                for p in flatten(ts, payload):
+                    dpid = safe_int(p.get("dpid"))
+                    port = safe_int(p.get("port_no", p.get("port", 0)))
+                    if port == LOCAL_PORT:
+                        continue
+
+                    rx_pkts = safe_int(p.get("rx_packets", p.get("rx_pkts", 0)))
+                    tx_pkts = safe_int(p.get("tx_packets", p.get("tx_pkts", 0)))
+                    rx_bytes = safe_int(p.get("rx_bytes", 0))
+                    tx_bytes = safe_int(p.get("tx_bytes", 0))
+                    rx_drop  = safe_int(p.get("rx_dropped", 0))
+                    tx_drop  = safe_int(p.get("tx_dropped", 0))
+                    rx_err   = safe_int(p.get("rx_errors", 0))
+                    tx_err   = safe_int(p.get("tx_errors", 0))
+
+                    key = (dpid, port)
+                    prv = prev.get(key)
+                    if prv:
+                        dt = max(1e-6, ts - prv["ts"])
+                        tx_bps = (tx_bytes - prv["tx_bytes"]) * 8.0 / dt
+                        rx_bps = (rx_bytes - prv["rx_bytes"]) * 8.0 / dt
+                        drop_ps = ((rx_drop - prv["rx_drop"]) + (tx_drop - prv["tx_drop"])) / dt
+                        err_ps  = ((rx_err  - prv["rx_err"])  + (tx_err  - prv["tx_err"]))  / dt
+                    else:
+                        tx_bps = rx_bps = drop_ps = err_ps = 0.0
+
+                    prev[key] = {"ts": ts, "rx_bytes": rx_bytes, "tx_bytes": tx_bytes,
+                                 "rx_drop": rx_drop, "tx_drop": tx_drop,
+                                 "rx_err": rx_err, "tx_err": tx_err}
+
+                    writer.writerow([ts, dpid, port,
+                                     rx_pkts, tx_pkts, rx_bytes, tx_bytes,
+                                     rx_drop, tx_drop, rx_err, tx_err,
+                                     rx_bps, tx_bps, rx_bps/1e6, tx_bps/1e6,
+                                     drop_ps, err_ps])
                 f.flush()
 
-            sleep_for = max(0.0, next_tick - time.time())
-            time.sleep(sleep_for)
+            time.sleep(max(0.0, next_tick - time.time()))
     except KeyboardInterrupt:
         pass
     finally:
