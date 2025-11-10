@@ -1,0 +1,14 @@
+{
+  "controller": "127.0.0.1:6633",
+  "bw": 10.0,
+  "pathA": {
+    "delay": "10ms",
+    "loss": 0.0
+  },
+  "pathB": {
+    "delay1": "15ms",
+    "delay2": "15ms",
+    "loss1": 0.0,
+    "loss2": 0.0
+  }
+}
