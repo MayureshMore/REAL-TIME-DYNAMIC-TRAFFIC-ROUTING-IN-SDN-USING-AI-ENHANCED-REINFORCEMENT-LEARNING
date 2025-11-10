@@ -1,0 +1,1 @@
+ts,dpid,port,rx_packets,tx_packets,rx_bytes,tx_bytes,rx_dropped,tx_dropped,rx_errors,tx_errors,rx_rate_bps,tx_rate_bps,rx_rate_mbps,tx_rate_mbps,loss_pct,err_pct
