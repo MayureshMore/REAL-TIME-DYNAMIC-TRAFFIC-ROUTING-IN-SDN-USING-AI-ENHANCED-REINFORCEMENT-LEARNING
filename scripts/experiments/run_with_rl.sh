@@ -13,6 +13,7 @@ K="${K:-2}"
 
 AGENT="${REPO}/rl-agent/bandit_agent.py"
 LOGGER="${REPO}/scripts/metrics/log_stats.py"
+ENSURE="${REPO}/scripts/ensure_controller.sh"
 LOG_DIR="${REPO}/docs/baseline"
 
 die(){ echo "[x] $*" >&2; exit 1; }
@@ -28,10 +29,26 @@ wait_for_controller(){
     fi
     sleep 1
   done
-  die "controller not healthy at ${API_BASE}/health"
+  return 1
 }
 
-# Return "MAC1 MAC2" when ≥2 hosts exist (regardless of ipv4 state)
+bootstrap_controller_if_needed(){
+  if wait_for_controller; then
+    return 0
+  fi
+  # Try to start it ourselves
+  say "[ctrl] controller not healthy; starting via ensure_controller.sh"
+  WSAPI_PORT="${WSAPI_PORT}" OF_PORT="${OF_PORT:-6633}" \
+    "${ENSURE}" "${OF_PORT:-6633}" "${WSAPI_PORT}" >/tmp/rl.ensure.log 2>&1 || true
+  # Try again
+  wait_for_controller || {
+    say "[diag] ensure_controller output (tail):"
+    tail -n 80 /tmp/rl.ensure.log 2>/dev/null || true
+    die "controller still not healthy at ${API_BASE}/health"
+  }
+}
+
+# Return "MAC1 MAC2" when ≥2 hosts exist
 wait_for_hosts(){
   local deadline=$(( $(date +%s) + 90 ))
   while [ "$(date +%s)" -lt "${deadline}" ]; do
@@ -53,10 +70,9 @@ wait_for_hosts(){
   return 1
 }
 
-# Ping once from h1→h2 to force ARP/IPv4 learning inside Mininet namespaces
+# Force ARP/IPv4 learning by pinging h2 from h1 once
 stimulate_ipv4(){
   local h1_pid h2_ip
-  # Grab a mininet host shell PID (best-effort)
   h1_pid="$(pgrep -f 'mininet:h1' | head -n1 || true)"
   h2_ip="${1:-10.0.0.2}"
   if [ -n "${h1_pid}" ]; then
@@ -64,7 +80,7 @@ stimulate_ipv4(){
   fi
 }
 
-# Wait until both hosts show a non-empty ipv4 list
+# Wait until hosts show non-empty ipv4 lists
 wait_for_ipv4(){
   local deadline=$(( $(date +%s) + 30 ))
   while [ "$(date +%s)" -lt "${deadline}" ]; do
@@ -85,7 +101,8 @@ wait_for_ipv4(){
 }
 
 main(){
-  wait_for_controller
+  # Make sure controller is up (self-heal if not)
+  bootstrap_controller_if_needed
 
   # Discover two hosts
   local macs H1 H2
@@ -93,11 +110,11 @@ main(){
   read -r H1 H2 <<<"${macs}"
   say "[ok] hosts: ${H1} ${H2}"
 
-  # Warm the path table and force ARP learning
+  # Warm path cache and force ARP learning
   curl -sf "${API_BASE}/paths?src_mac=${H1}&dst_mac=${H2}&k=${K}" >/dev/null || true
   curl -sf "${API_BASE}/paths?src_mac=${H2}&dst_mac=${H1}&k=${K}" >/dev/null || true
   stimulate_ipv4 "10.0.0.2"
-  wait_for_ipv4 || say "[warn] ipv4 not confirmed in /hosts; proceeding anyway"
+  wait_for_ipv4 || say "[warn] ipv4 not confirmed in /hosts; continuing"
 
   mkdir -p "${LOG_DIR}"
   local ts csv
@@ -133,11 +150,12 @@ main(){
 
   if [ ${agent_rc} -ne 0 ]; then
     say "[x] agent failed (rc=${agent_rc})"
-    tail -n 80 /tmp/agent.out || true
+    say "[diag] tail -n 80 /tmp/agent.out"; tail -n 80 /tmp/agent.out || true
+    say "[diag] tail -n 80 /tmp/logger.out"; tail -n 80 /tmp/logger.out || true
     exit ${agent_rc}
   fi
 
-  # Emit the CSV path for callers (auto_demo picks this up)
+  # Emit the CSV path for the caller (auto_demo.sh scrapes this)
   echo "${csv}"
 }
 
